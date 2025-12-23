@@ -236,26 +236,3 @@ func (a *Authority) NotifyFailure(ctx context.Context, csr *x509.CertificateRequ
 	p := provisionerFromContext(ctx)
 	return p.NotifyFailure(ctx, csr, transactionID, errorCode, errorDescription)
 }
-
-func (a *Authority) selectSigner(ctx context.Context) (cert *x509.Certificate, signer crypto.Signer, err error) {
-	p := provisionerFromContext(ctx)
-	cert, signer = p.GetSigner()
-	switch {
-	case cert != nil && signer != nil:
-		return
-	case cert == nil && signer != nil:
-		return nil, nil, fmt.Errorf("provisioner %q does not have a signer certificate available", p.GetName())
-	case cert != nil && signer == nil:
-		return nil, nil, fmt.Errorf("provisioner %q does not have a signer available", p.GetName())
-	}
-
-	cert, signer = a.signerCertificate, a.defaultSigner
-	switch {
-	case cert == nil && signer != nil:
-		return nil, nil, fmt.Errorf("provisioner %q does not have a default signer certificate available", p.GetName())
-	case cert != nil && signer == nil:
-		return nil, nil, fmt.Errorf("provisioner %q does not have a default signer available", p.GetName())
-	}
-
-	return
-}

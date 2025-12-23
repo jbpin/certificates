@@ -19,10 +19,7 @@ type EST struct {
 	ID                                 string   `json:"-"`
 	Type                               string   `json:"type"`
 	Name                               string   `json:"name"`
-	Secret                             string   `json:"secret,omitempty"`
 	EnableTLSClientCertificate         *bool    `json:"enableTLSClientCertificate,omitempty"`
-	EnableTLSExternalClientCertificate *bool    `json:"enableTLSExternalClientCertificate,omitempty"`
-	EnableTLSSharedSecret              *bool    `json:"enableTLSSharedSecret,omitempty"`
 	EnableHTTPBasicAuth                *bool    `json:"enableHTTPBasicAuth,omitempty"`
 	BasicAuthUsername                  string   `json:"basicAuthUsername,omitempty"`
 	BasicAuthPassword                  string   `json:"basicAuthPassword,omitempty"`

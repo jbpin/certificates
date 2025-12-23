@@ -8,7 +8,6 @@ type AuthMethod string
 const (
 	AuthMethodTLSClientCertificate         AuthMethod = "tls-client-certificate"
 	AuthMethodTLSExternalClientCertificate AuthMethod = "tls-external-client-certificate"
-	AuthMethodTLSSharedSecret              AuthMethod = "tls-shared-secret"
 	AuthMethodHTTPBasicAuth                AuthMethod = "http-basic-auth"
 )
 

@@ -2,7 +2,6 @@
 package api
 
 import (
-	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/base64"
@@ -282,29 +281,6 @@ func requireContentType(r *http.Request, want string) error {
 		return fmt.Errorf("unsupported Content-Type %q", mt)
 	}
 	return nil
-}
-
-func issuedCertFromCSR(csr *x509.CertificateRequest, chain []*x509.Certificate) (*x509.Certificate, error) {
-	if len(chain) == 0 {
-		return nil, errors.New("empty certificate chain")
-	}
-
-	csrKey, err := x509.MarshalPKIXPublicKey(csr.PublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed marshaling CSR public key: %w", err)
-	}
-
-	for _, cert := range chain {
-		certKey, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed marshaling issued certificate public key: %w", err)
-		}
-		if bytes.Equal(csrKey, certKey) {
-			return cert, nil
-		}
-	}
-
-	return nil, errors.New("issued certificate not found in chain")
 }
 
 func writeResponse(w http.ResponseWriter, r *http.Request, data []byte, contentType string, status int) {

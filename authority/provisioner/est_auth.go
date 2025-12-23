@@ -22,7 +22,6 @@ type ESTAuthMethod string
 const (
 	ESTAuthMethodTLSClientCertificate         ESTAuthMethod = "tls-client-certificate"
 	ESTAuthMethodTLSExternalClientCertificate ESTAuthMethod = "tls-external-client-certificate"
-	ESTAuthMethodTLSSharedSecret              ESTAuthMethod = "tls-shared-secret"
 	ESTAuthMethodHTTPBasicAuth                ESTAuthMethod = "http-basic-auth"
 )
 
@@ -77,21 +76,6 @@ func (s *EST) AuthorizeTLSExternalClientCertificate(ctx context.Context, cert *x
 	return nil
 }
 
-// AuthorizeTLSSharedSecret validates a shared secret provided over TLS.
-func (s *EST) AuthorizeTLSSharedSecret(ctx context.Context, csr *x509.CertificateRequest, secret string) error {
-	method, err := s.AuthorizeRequest(ctx, ESTAuthRequest{
-		CSR:               csr,
-		BasicAuthPassword: secret,
-	})
-	if err != nil {
-		return err
-	}
-	if method != ESTAuthMethodTLSSharedSecret {
-		return ErrESTAuthDenied
-	}
-	return nil
-}
-
 // AuthorizeHTTPBasicAuth validates a username/password pair for EST.
 func (s *EST) AuthorizeHTTPBasicAuth(ctx context.Context, csr *x509.CertificateRequest, username, password string) error {
 	method, err := s.AuthorizeRequest(ctx, ESTAuthRequest{
@@ -131,9 +115,6 @@ func (s *EST) authorizeRequestWithWebhook(ctx context.Context, req ESTAuthReques
 				return "", errors.New("missing basic auth credentials")
 			}
 		}
-		if method == ESTAuthMethodTLSSharedSecret && req.BasicAuthPassword == "" {
-			return "", errors.New("missing shared secret")
-		}
 		if req.CSR == nil {
 			return "", errors.New("missing CSR for basic auth validation")
 		}
@@ -161,7 +142,7 @@ func (s *EST) authorizeRequestLocal(ctx context.Context, req ESTAuthRequest) (ES
 				lastErr = err
 			}
 		}
-		if boolValue(s.EnableTLSExternalClientCertificate, false) {
+		if s.hasClientCertificateRoots() {
 			if s.clientCertificateRootPool == nil {
 				lastErr = ErrESTAuthMethodDisabled
 			} else if err := verifyCertificateWithPool(req.ClientCertificate, req.ClientCertificateChain, s.clientCertificateRootPool, nil); err == nil {
@@ -189,15 +170,6 @@ func (s *EST) authorizeRequestLocal(ctx context.Context, req ESTAuthRequest) (ES
 			}
 			return ESTAuthMethodHTTPBasicAuth, nil
 		}
-		if boolValue(s.EnableTLSSharedSecret, false) {
-			if req.BasicAuthPassword == "" {
-				return "", errors.New("missing shared secret")
-			}
-			if err := s.validateBasicAuthPassword(req.BasicAuthPassword); err != nil {
-				return "", err
-			}
-			return ESTAuthMethodTLSSharedSecret, nil
-		}
 		return "", ErrESTAuthMethodDisabled
 	}
 
@@ -209,7 +181,7 @@ func (s *EST) preferredCertAuthMethod() (ESTAuthMethod, error) {
 	switch {
 	case boolValue(s.EnableTLSClientCertificate, false):
 		return ESTAuthMethodTLSClientCertificate, nil
-	case boolValue(s.EnableTLSExternalClientCertificate, false):
+	case s.hasClientCertificateRoots():
 		return ESTAuthMethodTLSExternalClientCertificate, nil
 	default:
 		return "", ErrESTAuthMethodDisabled
@@ -221,8 +193,6 @@ func (s *EST) preferredBasicAuthMethod() (ESTAuthMethod, error) {
 	switch {
 	case boolValue(s.EnableHTTPBasicAuth, false):
 		return ESTAuthMethodHTTPBasicAuth, nil
-	case boolValue(s.EnableTLSSharedSecret, false):
-		return ESTAuthMethodTLSSharedSecret, nil
 	default:
 		return "", ErrESTAuthMethodDisabled
 	}
@@ -300,20 +270,14 @@ func (s *EST) hasAuthWebhooks() bool {
 func (s *EST) normalizeAuthConfig() error {
 	if !s.authMethodsConfigured() {
 		enable := true
-		s.EnableTLSSharedSecret = &enable
+		s.EnableHTTPBasicAuth = &enable
 	}
 	if s.EnableHTTPBasicAuth == nil && (s.BasicAuthUsername != "" || s.BasicAuthPassword != "") {
 		enable := true
 		s.EnableHTTPBasicAuth = &enable
 	}
-	if boolValue(s.EnableTLSSharedSecret, false) && s.Secret == "" && !s.hasAuthWebhooks() {
-		return errors.New("provisioner secret cannot be empty")
-	}
 	if boolValue(s.EnableHTTPBasicAuth, false) && s.BasicAuthPassword == "" && !s.hasAuthWebhooks() {
 		return errors.New("basic auth password cannot be empty")
-	}
-	if boolValue(s.EnableTLSExternalClientCertificate, false) && s.clientCertificateRootPool == nil {
-		return errors.New("clientCertificateRoots cannot be empty")
 	}
 	return nil
 }
@@ -321,8 +285,7 @@ func (s *EST) normalizeAuthConfig() error {
 // authMethodsConfigured reports whether any auth method is explicitly configured.
 func (s *EST) authMethodsConfigured() bool {
 	return s.EnableTLSClientCertificate != nil ||
-		s.EnableTLSExternalClientCertificate != nil ||
-		s.EnableTLSSharedSecret != nil ||
+		s.hasClientCertificateRoots() ||
 		s.EnableHTTPBasicAuth != nil
 }
 
@@ -353,6 +316,10 @@ func (s *EST) parseClientCertificateRoots() error {
 		return errors.New("error parsing clientCertificateRoots: no certificates found")
 	}
 	return nil
+}
+
+func (s *EST) hasClientCertificateRoots() bool {
+	return len(s.ClientCertificateRoots) > 0
 }
 
 // verifyCertificate validates the client certificate against CA roots.
