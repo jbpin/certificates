@@ -1,6 +1,7 @@
 package est
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/x509"
@@ -8,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/smallstep/pkcs7"
-	smallscep "github.com/smallstep/scep"
 
 	"go.step.sm/crypto/x509util"
 
@@ -17,22 +17,16 @@ import (
 
 // Authority handles EST interactions.
 type Authority struct {
-	signAuth             SignAuthority
-	roots                []*x509.Certificate
-	intermediates        []*x509.Certificate
-	defaultSigner        crypto.Signer
-	signerCertificate    *x509.Certificate
-	estProvisionerNames  []string
-	provisionersMutex    sync.RWMutex
+	signAuth            SignAuthority
+	roots               []*x509.Certificate
+	intermediates       []*x509.Certificate
+	defaultSigner       crypto.Signer
+	signerCertificate   *x509.Certificate
+	estProvisionerNames []string
+	provisionersMutex   sync.RWMutex
 }
 
 type authorityKey struct{}
-
-// SignAuthority is the interface for a signing authority.
-type SignAuthority interface {
-	SignWithContext(ctx context.Context, cr *x509.CertificateRequest, opts provisioner.SignOptions, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error)
-	LoadProvisionerByName(string) (provisioner.Interface, error)
-}
 
 // NewContext adds the given authority to the context.
 func NewContext(ctx context.Context, a *Authority) context.Context {
@@ -58,6 +52,12 @@ func MustFromContext(ctx context.Context) *Authority {
 	return a
 }
 
+// SignAuthority is the interface for a signing authority.
+type SignAuthority interface {
+	SignWithContext(ctx context.Context, cr *x509.CertificateRequest, opts provisioner.SignOptions, signOpts ...provisioner.SignOption) ([]*x509.Certificate, error)
+	LoadProvisionerByName(string) (provisioner.Interface, error)
+}
+
 // New returns a new Authority that implements the EST interface.
 func New(signAuth SignAuthority, opts Options) (*Authority, error) {
 	if err := opts.Validate(); err != nil {
@@ -74,7 +74,7 @@ func New(signAuth SignAuthority, opts Options) (*Authority, error) {
 	}, nil
 }
 
-// Validate validates if the EST Authority has a valid configuration.
+// validates if the EST Authority has a valid configuration.
 func (a *Authority) Validate() error {
 	if a == nil {
 		return nil
@@ -83,13 +83,20 @@ func (a *Authority) Validate() error {
 	a.provisionersMutex.RLock()
 	defer a.provisionersMutex.RUnlock()
 
+	noDefaultSignerAvailable := a.defaultSigner == nil || a.signerCertificate == nil
 	for _, name := range a.estProvisionerNames {
 		p, err := a.LoadProvisionerByName(name)
 		if err != nil {
 			return fmt.Errorf("failed loading provisioner %q: %w", name, err)
 		}
-		if _, ok := p.(*provisioner.EST); ok {
-			continue
+		if estProv, ok := p.(*provisioner.EST); ok {
+			cert, signer := estProv.GetSigner()
+			if cert == nil && noDefaultSignerAvailable {
+				return fmt.Errorf("EST provisioner %q does not have a signer certificate", name)
+			}
+			if signer == nil && noDefaultSignerAvailable {
+				return fmt.Errorf("EST provisioner %q does not have a signer", name)
+			}
 		}
 	}
 
@@ -136,7 +143,12 @@ func (a *Authority) GetCACertificates(ctx context.Context) (certs []*x509.Certif
 }
 
 // SignCSR signs the CSR using the provisioner and returns the issued chain.
-func (a *Authority) SignCSR(ctx context.Context, csr *x509.CertificateRequest, signCSROpts ...provisioner.SignCSROption) ([]*x509.Certificate, error) {
+func (a *Authority) SignCSR(ctx context.Context, csr *x509.CertificateRequest, signCSROpts ...provisioner.SignCSROption) (*x509.Certificate, error) {
+	// TODO: intermediate storage of the request? In EST it's possible to request a csr/certificate
+	// to be signed, which can be performed asynchronously / out-of-band. In that case a client can
+	// poll for the status. It seems to be similar as what can happen in ACME and SCEP, so might want to model
+	// the implementation after the one in the ACME authority. Requires storage, etc.
+	// ref: https://datatracker.ietf.org/doc/html/rfc7030#section-4.2.3
 	p := provisionerFromContext(ctx)
 
 	// Template data
@@ -194,42 +206,35 @@ func (a *Authority) SignCSR(ctx context.Context, csr *x509.CertificateRequest, s
 	if err != nil {
 		return nil, fmt.Errorf("error generating certificate: %w", err)
 	}
-
-	return certChain, nil
+	// return leaf certificate (only): https://datatracker.ietf.org/doc/html/rfc7030#section-4.2.3
+	return certChain[0], nil
 }
 
-// BuildSignedChain returns a PKCS7 signedData structure containing the cert chain.
-func (a *Authority) BuildSignedChain(ctx context.Context, certs []*x509.Certificate) ([]byte, error) {
+// BuildResponse returns a certs-only PKCS7 SignedData for the given certs.
+func (a *Authority) BuildResponse(ctx context.Context, certs []*x509.Certificate) ([]byte, error) {
 	if len(certs) == 0 {
 		return nil, fmt.Errorf("no certificates to encode")
 	}
-
-	// Build degenerate PKCS7 from chain.
-	deg, err := smallscep.DegenerateCertificates(certs)
-	if err != nil {
-		return nil, fmt.Errorf("failed generating degenerate certificate: %w", err)
+	// Build degenerate PKCS7: SignedData with no encapsulated content or signer infos.
+	var buf bytes.Buffer
+	for _, cert := range certs {
+		buf.Write(cert.Raw)
 	}
-
-	signerCert, signer, err := a.selectSigner(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed selecting signer: %w", err)
-	}
-
-	signedData, err := pkcs7.NewSignedData(deg)
+	degenerate, err := pkcs7.DegenerateCertificate(buf.Bytes())
 	if err != nil {
 		return nil, err
 	}
-	if err := signedData.AddSigner(signerCert, signer, pkcs7.SignerInfoConfig{}); err != nil {
-		return nil, err
-	}
-
-	return signedData.Finish()
+	return degenerate, nil
 }
 
-// ValidateChallenge validates the provided shared secret using the provisioner.
-func (a *Authority) ValidateChallenge(ctx context.Context, secret string) error {
+func (a *Authority) NotifySuccess(ctx context.Context, csr *x509.CertificateRequest, cert *x509.Certificate, transactionID string) error {
 	p := provisionerFromContext(ctx)
-	return p.ValidateSharedSecret(ctx, secret)
+	return p.NotifySuccess(ctx, csr, cert, transactionID)
+}
+
+func (a *Authority) NotifyFailure(ctx context.Context, csr *x509.CertificateRequest, transactionID string, errorCode int, errorDescription string) error {
+	p := provisionerFromContext(ctx)
+	return p.NotifyFailure(ctx, csr, transactionID, errorCode, errorDescription)
 }
 
 func (a *Authority) selectSigner(ctx context.Context) (cert *x509.Certificate, signer crypto.Signer, err error) {

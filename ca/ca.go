@@ -329,12 +329,10 @@ func (ca *CA) Init(cfg *config.Config) (*CA, error) {
 	//dumpRoutes(insecureMux)
 
 	// EST endpoints (HTTPS only)
+	estPrefix := ".well-known/est"
 	if estAuth := auth.GetEST(); estAuth != nil {
 		estAuthority = estAuth
-		mux.Route("/.well-known/est", func(r chi.Router) {
-			estAPI.Route(r)
-		})
-		mux.Route("/est", func(r chi.Router) {
+		mux.Route("/"+estPrefix, func(r chi.Router) {
 			estAPI.Route(r)
 		})
 	}

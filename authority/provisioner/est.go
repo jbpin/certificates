@@ -3,35 +3,44 @@ package provisioner
 import (
 	"context"
 	"crypto"
-	"crypto/subtle"
 	"crypto/x509"
+	"fmt"
 	"time"
 
 	"github.com/pkg/errors"
 
+	"github.com/smallstep/certificates/internal/httptransport"
 	"github.com/smallstep/linkedca"
 )
 
 // EST is the EST provisioner type, an entity that can authorize the EST flow.
 type EST struct {
 	*base
-	ID                       string   `json:"-"`
-	Type                     string   `json:"type"`
-	Name                     string   `json:"name"`
-	Secret                   string   `json:"secret,omitempty"`
-	ForceCN                  bool     `json:"forceCN,omitempty"`
-	Capabilities             []string `json:"capabilities,omitempty"`
-	IncludeRoot              bool     `json:"includeRoot,omitempty"`
-	ExcludeIntermediate      bool     `json:"excludeIntermediate,omitempty"`
-	MinimumPublicKeyLength   int      `json:"minimumPublicKeyLength,omitempty"`
-	CSRAttrs                 []byte   `json:"csrAttrs,omitempty"`
-	Options                  *Options `json:"options,omitempty"`
-	Claims                   *Claims  `json:"claims,omitempty"`
-	ctl                      *Controller
-	signer                   crypto.Signer
-	signerCertificate        *x509.Certificate
-	notificationController   *notificationController
-	challengeValidationMutex struct{}
+	ID                                 string   `json:"-"`
+	Type                               string   `json:"type"`
+	Name                               string   `json:"name"`
+	Secret                             string   `json:"secret,omitempty"`
+	EnableTLSClientCertificate         *bool    `json:"enableTLSClientCertificate,omitempty"`
+	EnableTLSExternalClientCertificate *bool    `json:"enableTLSExternalClientCertificate,omitempty"`
+	EnableTLSSharedSecret              *bool    `json:"enableTLSSharedSecret,omitempty"`
+	EnableHTTPBasicAuth                *bool    `json:"enableHTTPBasicAuth,omitempty"`
+	BasicAuthUsername                  string   `json:"basicAuthUsername,omitempty"`
+	BasicAuthPassword                  string   `json:"basicAuthPassword,omitempty"`
+	ClientCertificateRoots             []byte   `json:"clientCertificateRoots,omitempty"`
+	ForceCN                            bool     `json:"forceCN,omitempty"`
+	Capabilities                       []string `json:"capabilities,omitempty"`
+	IncludeRoot                        bool     `json:"includeRoot,omitempty"`
+	ExcludeIntermediate                bool     `json:"excludeIntermediate,omitempty"`
+	MinimumPublicKeyLength             int      `json:"minimumPublicKeyLength,omitempty"`
+	CSRAttrs                           []byte   `json:"csrAttrs,omitempty"`
+	Options                            *Options `json:"options,omitempty"`
+	Claims                             *Claims  `json:"claims,omitempty"`
+	ctl                                *Controller
+	signer                             crypto.Signer
+	signerCertificate                  *x509.Certificate
+	challengeValidationController      *challengeValidationController
+	notificationController             *notificationController
+	clientCertificateRootPool          *x509.CertPool
 }
 
 // GetID returns the provisioner unique identifier.
@@ -77,6 +86,27 @@ func (s *EST) DefaultTLSCertDuration() time.Duration {
 	return s.ctl.Claimer.DefaultTLSCertDuration()
 }
 
+// newChallengeValidationController creates a new challengeValidationController
+// that performs challenge validation through webhooks.
+func newESTChallengeValidationController(client HTTPClient, tw httptransport.Wrapper, webhooks []*Webhook) *challengeValidationController {
+	scepHooks := []*Webhook{}
+	for _, wh := range webhooks {
+		// if wh.Kind != linkedca.Webhook_ESTCHALLENGE.String() {
+		if wh.Kind != "ESTCHALLENGE" {
+			continue
+		}
+		if !isCertTypeOK(wh) {
+			continue
+		}
+		scepHooks = append(scepHooks, wh)
+	}
+	return &challengeValidationController{
+		client:        client,
+		wrapTransport: tw,
+		webhooks:      scepHooks,
+	}
+}
+
 // Init initializes and validates the fields of an EST type.
 func (s *EST) Init(config Config) (err error) {
 	switch {
@@ -93,16 +123,33 @@ func (s *EST) Init(config Config) (err error) {
 		return errors.Errorf("%d bits is not exactly divisible by 8", s.MinimumPublicKeyLength)
 	}
 
-	// Only static shared secret auth in the first iteration.
-	if s.Secret == "" {
-		return errors.New("provisioner secret cannot be empty")
+	// Prepare the EST challenge validator
+	s.challengeValidationController = newESTChallengeValidationController(
+		config.WebhookClient,
+		config.WrapTransport,
+		s.GetOptions().GetWebhooks(),
+	)
+
+	// Prepare the EST notification controller
+	s.notificationController = newNotificationController(
+		config.WebhookClient,
+		config.WrapTransport,
+		s.GetOptions().GetWebhooks(),
+	)
+
+	if err := s.parseClientCertificateRoots(); err != nil {
+		return err
+	}
+
+	if err := s.normalizeAuthConfig(); err != nil {
+		return err
 	}
 
 	s.ctl, err = NewController(s, s.Claims, config, s.Options)
 	return err
 }
 
-// AuthorizeSign does not do any verification beyond the shared secret; main validation is in the EST protocol.
+// AuthorizeSign does not do any verification; main validation is in the EST protocol.
 func (s *EST) AuthorizeSign(context.Context, string) ([]SignOption, error) {
 	return []SignOption{
 		s,
@@ -131,15 +178,21 @@ func (s *EST) GetSigner() (*x509.Certificate, crypto.Signer) {
 	return s.signerCertificate, s.signer
 }
 
-// ValidateSharedSecret checks the provided secret against the configured static secret.
-func (s *EST) ValidateSharedSecret(_ context.Context, secret string) error {
-	if subtle.ConstantTimeCompare([]byte(s.Secret), []byte(secret)) == 0 {
-		return errors.New("invalid shared secret")
-	}
-	return nil
-}
-
 // GetCSRAttributes returns the CSR attributes to signal to clients.
 func (s *EST) GetCSRAttributes(context.Context) ([]byte, error) {
 	return s.CSRAttrs, nil
+}
+
+func (s *EST) NotifySuccess(ctx context.Context, csr *x509.CertificateRequest, cert *x509.Certificate, transactionID string) error {
+	if s.notificationController == nil {
+		return fmt.Errorf("provisioner %q wasn't initialized", s.Name)
+	}
+	return s.notificationController.Success(ctx, csr, cert, transactionID)
+}
+
+func (s *EST) NotifyFailure(ctx context.Context, csr *x509.CertificateRequest, transactionID string, errorCode int, errorDescription string) error {
+	if s.notificationController == nil {
+		return fmt.Errorf("provisioner %q wasn't initialized", s.Name)
+	}
+	return s.notificationController.Failure(ctx, csr, transactionID, errorCode, errorDescription)
 }

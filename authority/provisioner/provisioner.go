@@ -332,6 +332,8 @@ func (l *List) UnmarshalJSON(data []byte) error {
 			p = &SCEP{}
 		case "nebula":
 			p = &Nebula{}
+		case "est":
+			p = &EST{}
 		default:
 			// Skip unsupported provisioners. A client using this method may be
 			// compiled with a version of smallstep/certificates that does not

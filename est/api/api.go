@@ -2,17 +2,19 @@
 package api
 
 import (
+	"bytes"
+	"context"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/smallstep/pkcs7"
 
 	"github.com/smallstep/certificates/api"
 	"github.com/smallstep/certificates/api/log"
@@ -27,17 +29,10 @@ const (
 
 // Route configures the EST routes under the provided router.
 func Route(r api.Router) {
-	// Well-known endpoints with provisioner path parameter.
-	r.MethodFunc(http.MethodGet, "/.well-known/est/{provisionerName}/cacerts", getCACerts)
-	r.MethodFunc(http.MethodGet, "/.well-known/est/{provisionerName}/csrattrs", getCSRAttrs)
-	r.MethodFunc(http.MethodPost, "/.well-known/est/{provisionerName}/simpleenroll", enroll)
-	r.MethodFunc(http.MethodPost, "/.well-known/est/{provisionerName}/simplereenroll", enroll)
-
-	// Alternate EST prefix.
-	r.MethodFunc(http.MethodGet, "/est/{provisionerName}/cacerts", getCACerts)
-	r.MethodFunc(http.MethodGet, "/est/{provisionerName}/csrattrs", getCSRAttrs)
-	r.MethodFunc(http.MethodPost, "/est/{provisionerName}/simpleenroll", enroll)
-	r.MethodFunc(http.MethodPost, "/est/{provisionerName}/simplereenroll", enroll)
+	r.MethodFunc(http.MethodGet, "/{provisionerName}/cacerts", getCACerts)
+	r.MethodFunc(http.MethodGet, "/{provisionerName}/csrattrs", getCSRAttrs)
+	r.MethodFunc(http.MethodPost, "/{provisionerName}/simpleenroll", enroll)
+	r.MethodFunc(http.MethodPost, "/{provisionerName}/simplereenroll", enroll)
 }
 
 func lookupProvisioner(next http.HandlerFunc) http.HandlerFunc {
@@ -89,7 +84,7 @@ func getCACertsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := auth.BuildSignedChain(ctx, certs)
+	data, err := auth.BuildResponse(ctx, certs)
 	if err != nil {
 		fail(w, r, fmt.Errorf("failed to encode CA certificates: %w", err))
 		return
@@ -124,17 +119,12 @@ func enroll(w http.ResponseWriter, r *http.Request) {
 
 func enrollHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	auth := est.MustFromContext(ctx)
-	// prov := est.ProvisionerFromContext(ctx)
-
-	secret, err := basicAuthSecret(r)
+	ctx, err := authContextFromRequest(ctx, r)
 	if err != nil {
+		if errors.Is(err, errMissingClientCertificateOrBasicAuth) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="EST"`)
+		}
 		failWithStatus(w, r, http.StatusUnauthorized, err)
-		return
-	}
-
-	if err := auth.ValidateChallenge(ctx, secret); err != nil {
-		failWithStatus(w, r, http.StatusUnauthorized, fmt.Errorf("invalid credentials: %w", err))
 		return
 	}
 
@@ -144,7 +134,18 @@ func enrollHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	csr, err := parseCSR(body)
+	if err := requireContentType(r, "application/pkcs10"); err != nil {
+		failWithStatus(w, r, http.StatusUnsupportedMediaType, err)
+		return
+	}
+
+	der, err := decodeBase64Payload(body)
+	if err != nil {
+		failWithStatus(w, r, http.StatusBadRequest, err)
+		return
+	}
+
+	csr, err := parseCSR(der)
 	if err != nil {
 		failWithStatus(w, r, http.StatusBadRequest, fmt.Errorf("failed parsing CSR: %w", err))
 		return
@@ -154,31 +155,83 @@ func enrollHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	certChain, err := auth.SignCSR(ctx, csr)
+	ctx, err = authorizeEnrollRequest(ctx, csr)
+	if err != nil {
+		failWithStatus(w, r, http.StatusUnauthorized, err)
+		return
+	}
+
+	r = r.WithContext(ctx)
+	auth := est.MustFromContext(ctx)
+
+	issued, err := auth.SignCSR(ctx, csr)
 	if err != nil {
 		failWithStatus(w, r, http.StatusInternalServerError, fmt.Errorf("failed issuing certificate: %w", err))
 		return
 	}
 
-	signed, err := auth.BuildSignedChain(ctx, certChain)
+	signed, err := auth.BuildResponse(ctx, []*x509.Certificate{issued})
 	if err != nil {
-		failWithStatus(w, r, http.StatusInternalServerError, fmt.Errorf("failed encoding certificate: %w", err))
+		failWithStatus(w, r, http.StatusInternalServerError, fmt.Errorf("failed encoding issued certificate: %w", err))
 		return
 	}
 
 	writeResponse(w, r, signed, "application/pkcs7-mime; smime-type=certs-only", http.StatusOK)
 }
 
-func basicAuthSecret(r *http.Request) (string, error) {
-	username, password, ok := r.BasicAuth()
-	_ = username // username is not used in this minimal auth scheme
-	if !ok {
-		return "", errors.New("missing basic auth")
+var errMissingClientCertificateOrBasicAuth = errors.New("missing client certificate or basic auth")
+
+// authContextFromRequest extracts auth material from the request into the context.
+func authContextFromRequest(ctx context.Context, r *http.Request) (context.Context, error) {
+	if r.TLS == nil {
+		return ctx, errors.New("missing TLS connection")
 	}
-	if password == "" {
-		return "", errors.New("empty basic auth password")
+
+	if len(r.TLS.PeerCertificates) > 0 {
+		ctx = est.NewClientCertificateContext(ctx, r.TLS.PeerCertificates[0])
+		ctx = est.NewClientCertificateChainContext(ctx, r.TLS.PeerCertificates)
 	}
-	return password, nil
+
+	if username, password, ok := r.BasicAuth(); ok {
+		ctx = est.NewBasicAuthContext(ctx, est.BasicAuth{
+			Username: username,
+			Password: password,
+		})
+	}
+
+	if _, ok := est.ClientCertificateFromContext(ctx); !ok {
+		if _, ok := est.BasicAuthFromContext(ctx); !ok {
+			return ctx, errMissingClientCertificateOrBasicAuth
+		}
+	}
+	return ctx, nil
+}
+
+// authorizeEnrollRequest validates the request against provisioner-configured auth methods.
+func authorizeEnrollRequest(ctx context.Context, csr *x509.CertificateRequest) (context.Context, error) {
+	prov := est.ProvisionerFromContext(ctx)
+	ca := authority.MustFromContext(ctx)
+
+	req := provisioner.ESTAuthRequest{
+		CSR:             csr,
+		CARoots:         ca.GetRootCertificates(),
+		CAIntermediates: ca.GetIntermediateCertificates(),
+	}
+	if cert, ok := est.ClientCertificateFromContext(ctx); ok {
+		req.ClientCertificate = cert
+		req.ClientCertificateChain, _ = est.ClientCertificateChainFromContext(ctx)
+	}
+	if auth, ok := est.BasicAuthFromContext(ctx); ok {
+		req.BasicAuthUsername = auth.Username
+		req.BasicAuthPassword = auth.Password
+	}
+
+	method, err := prov.AuthorizeRequest(ctx, req)
+	if err != nil {
+		return ctx, err
+	}
+	ctx = est.NewAuthMethodContext(ctx, est.AuthMethod(method))
+	return ctx, nil
 }
 
 func parseCSR(body []byte) (*x509.CertificateRequest, error) {
@@ -186,25 +239,72 @@ func parseCSR(body []byte) (*x509.CertificateRequest, error) {
 		return nil, errors.New("empty body")
 	}
 
-	// Try PEM first.
-	if b, _ := pem.Decode(body); b != nil {
-		return x509.ParseCertificateRequest(b.Bytes)
+	return x509.ParseCertificateRequest(body)
+}
+
+func decodeBase64Payload(body []byte) ([]byte, error) {
+	if len(body) == 0 {
+		return nil, errors.New("empty body")
 	}
 
-	// Try raw CSR DER.
-	if csr, err := x509.ParseCertificateRequest(body); err == nil {
-		return csr, nil
-	}
-
-	// Try PKCS7 wrapping.
-	if p7, err := pkcs7.Parse(body); err == nil {
-		if len(p7.Content) == 0 {
-			return nil, errors.New("pkcs7 message missing content")
+	trimmed := strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\n', '\r', '\t':
+			return -1
+		default:
+			return r
 		}
-		return x509.ParseCertificateRequest(p7.Content)
+	}, string(body))
+
+	if trimmed == "" {
+		return nil, errors.New("empty base64 payload")
 	}
 
-	return nil, errors.New("unable to parse CSR")
+	decoded := make([]byte, base64.StdEncoding.DecodedLen(len(trimmed)))
+	n, err := base64.StdEncoding.Decode(decoded, []byte(trimmed))
+	if err != nil {
+		return nil, fmt.Errorf("invalid base64 payload: %w", err)
+	}
+
+	return decoded[:n], nil
+}
+
+func requireContentType(r *http.Request, want string) error {
+	ct := r.Header.Get("Content-Type")
+	if ct == "" {
+		return errors.New("missing Content-Type header")
+	}
+	mt, _, err := mime.ParseMediaType(ct)
+	if err != nil {
+		return fmt.Errorf("invalid Content-Type header: %w", err)
+	}
+	if mt != want {
+		return fmt.Errorf("unsupported Content-Type %q", mt)
+	}
+	return nil
+}
+
+func issuedCertFromCSR(csr *x509.CertificateRequest, chain []*x509.Certificate) (*x509.Certificate, error) {
+	if len(chain) == 0 {
+		return nil, errors.New("empty certificate chain")
+	}
+
+	csrKey, err := x509.MarshalPKIXPublicKey(csr.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed marshaling CSR public key: %w", err)
+	}
+
+	for _, cert := range chain {
+		certKey, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed marshaling issued certificate public key: %w", err)
+		}
+		if bytes.Equal(csrKey, certKey) {
+			return cert, nil
+		}
+	}
+
+	return nil, errors.New("issued certificate not found in chain")
 }
 
 func writeResponse(w http.ResponseWriter, r *http.Request, data []byte, contentType string, status int) {
