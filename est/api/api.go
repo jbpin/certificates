@@ -196,30 +196,29 @@ func authContextFromRequest(ctx context.Context, r *http.Request) (context.Conte
 	prov := est.ProvisionerFromContext(ctx)
 	cfg := prov.GetClientCertificateConfig()
 
-	if cfg.Enable {
-		if cfg.ForwardedTLSClientCertHeader != "" {
-			// When a forwarded header is configured, only use it — never
-			// fall back to r.TLS.PeerCertificates, which would be the
-			// proxy's own certificate, not the actual client's.
-			if forwardedtlsClientCert := r.Header.Get(cfg.ForwardedTLSClientCertHeader); forwardedtlsClientCert != "" {
-				certDER, err := base64.StdEncoding.DecodeString(forwardedtlsClientCert)
-				if err != nil {
-					return ctx, fmt.Errorf("failed to decode client certificate from forwarded header: %w", err)
-				}
-				certs, err := x509.ParseCertificates(certDER)
-				if err != nil {
-					return ctx, fmt.Errorf("failed to parse client certificate from forwarded header: %w", err)
-				}
-				if len(certs) == 0 {
-					return ctx, errors.New("no certificates found in forwarded header")
-				}
-				ctx = est.NewClientCertificateContext(ctx, certs[0])
-				ctx = est.NewClientCertificateChainContext(ctx, certs)
+	if cfg.ForwardedTLSClientCertHeader != "" {
+		// When a forwarded header is configured, only use it — never
+		// fall back to r.TLS.PeerCertificates, which would be the
+		// proxy's own certificate, not the actual client's.
+		if forwardedtlsClientCert := r.Header.Get(cfg.ForwardedTLSClientCertHeader); forwardedtlsClientCert != "" {
+			certDER, err := base64.StdEncoding.DecodeString(forwardedtlsClientCert)
+			if err != nil {
+				return ctx, fmt.Errorf("failed to decode client certificate from forwarded header: %w", err)
 			}
-		} else if len(r.TLS.PeerCertificates) > 0 {
-			ctx = est.NewClientCertificateContext(ctx, r.TLS.PeerCertificates[0])
-			ctx = est.NewClientCertificateChainContext(ctx, r.TLS.PeerCertificates)
+			certs, err := x509.ParseCertificates(certDER)
+			if err != nil {
+				return ctx, fmt.Errorf("failed to parse client certificate from forwarded header: %w", err)
+			}
+			if len(certs) == 0 {
+				return ctx, errors.New("no certificates found in forwarded header")
+			}
+			ctx = est.NewClientCertificateContext(ctx, certs[0])
+			ctx = est.NewClientCertificateChainContext(ctx, certs)
 		}
+	} else if cfg.Enable && len(r.TLS.PeerCertificates) > 0 {
+		// Direct TLS: only when no forwarded header is configured.
+		ctx = est.NewClientCertificateContext(ctx, r.TLS.PeerCertificates[0])
+		ctx = est.NewClientCertificateChainContext(ctx, r.TLS.PeerCertificates)
 	}
 
 	if authHeader := r.Header.Get("Authorization"); authHeader != "" {

@@ -50,6 +50,9 @@ func (s *EST) AuthorizeRequest(ctx context.Context, req ESTAuthRequest) ([]SignC
 	if s.hasAuthWebhooks() {
 		return s.authorizeWithWebhook(ctx, &req)
 	}
+	if req.BearerToken != "" {
+		return nil, errors.New("bearer token authentication requires a webhook to be configured")
+	}
 	return s.authorizeRequestLocal(req)
 }
 
