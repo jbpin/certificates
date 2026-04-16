@@ -1060,7 +1060,8 @@ func (a *Authority) GetSCEP() *scep.Authority {
 	return a.scepAuthority
 }
 
-// HasACMEProvisioner returns true if at least one ACME provisioner is configured.
+// HasACMEProvisioner iterates over the configured provisioners
+// and determines if at least one of them is an ACME provisioner.
 func (a *Authority) HasACMEProvisioner() bool {
 	for _, p := range a.config.AuthorityConfig.Provisioners {
 		if p.GetType() == provisioner.TypeACME {
