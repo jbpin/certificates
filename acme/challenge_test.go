@@ -3890,6 +3890,195 @@ func Test_doStepAttestationFormat(t *testing.T) {
 	}
 }
 
+// androidTestChain builds an Android Key Attestation chain the way a device
+// with factory-provisioned keys presents one: every certificate in it expired
+// long ago, and the root is a certificate the CA doesn't ship. The reissued
+// root carries the same key and is what the CA trusts.
+type androidTestChain struct {
+	leaf, intermediate, expiredRoot, reissuedRoot *x509.Certificate
+	sig                                          []byte
+	jwk                                          *jose.JSONWebKey
+}
+
+func mustAndroidTestChain(t *testing.T) *androidTestChain {
+	t.Helper()
+
+	newCert := func(tmpl, parent *x509.Certificate, pub crypto.PublicKey, signer crypto.Signer) *x509.Certificate {
+		t.Helper()
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, parent, pub, signer)
+		require.NoError(t, err)
+		cert, err := x509.ParseCertificate(der)
+		require.NoError(t, err)
+		return cert
+	}
+
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	rootSubject := pkix.Name{CommonName: "Android Attestation Root"}
+
+	// the root the device presents, expired two months ago
+	expiredRootTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               rootSubject,
+		NotBefore:             time.Now().Add(-10 * 365 * 24 * time.Hour),
+		NotAfter:              time.Now().Add(-60 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	expiredRoot := newCert(expiredRootTmpl, expiredRootTmpl, rootKey.Public(), rootKey)
+
+	// the root the CA trusts: same key and subject, reissued with a longer validity
+	reissuedRootTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               rootSubject,
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	reissuedRoot := newCert(reissuedRootTmpl, reissuedRootTmpl, rootKey.Public(), rootKey)
+	require.True(t, reissuedRoot.PublicKey.(*ecdsa.PublicKey).Equal(expiredRoot.PublicKey))
+
+	// the batch certificate shipped with the device, expired as well
+	intKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	intermediate := newCert(&x509.Certificate{
+		SerialNumber:          big.NewInt(3),
+		Subject:               pkix.Name{CommonName: "Android Attestation Intermediate"},
+		NotBefore:             time.Now().Add(-10 * 365 * 24 * time.Hour),
+		NotAfter:              time.Now().Add(-60 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}, expiredRoot, intKey.Public(), rootKey)
+
+	jwk, keyAuth := mustAccountAndKeyAuthorization(t, "token")
+	signer, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	attestBytes, err := attestation.CreateKeyDescription(&attestation.KeyDescription{
+		AttestationVersion:       300,
+		AttestationSecurityLevel: 1,
+		AttestationChallenge:     []byte(keyAuth),
+		TeeEnforced: attestation.AuthorizationList{
+			AttestationIdSerial: []byte("serial-number"),
+		},
+	})
+	require.NoError(t, err)
+
+	// the attested key itself, with a validity window that also lapsed
+	leaf := newCert(&x509.Certificate{
+		SerialNumber: big.NewInt(4),
+		Subject:      pkix.Name{CommonName: "attestation cert"},
+		NotBefore:    time.Now().Add(-10 * 365 * 24 * time.Hour),
+		NotAfter:     time.Now().Add(-60 * 24 * time.Hour),
+		ExtraExtensions: []pkix.Extension{
+			{Id: oidAndroidAttestation, Value: attestBytes},
+		},
+	}, intermediate, signer.Public(), intKey)
+
+	keyAuthSum := sha256.Sum256([]byte(keyAuth))
+	sig, err := signer.Sign(rand.Reader, keyAuthSum[:], crypto.SHA256)
+	require.NoError(t, err)
+
+	return &androidTestChain{
+		leaf: leaf, intermediate: intermediate,
+		expiredRoot: expiredRoot, reissuedRoot: reissuedRoot,
+		sig: sig, jwk: jwk,
+	}
+}
+
+func (c *androidTestChain) attestationObject(x5c ...*x509.Certificate) *attestationObject {
+	raw := make([]any, 0, len(x5c))
+	for _, cert := range x5c {
+		raw = append(raw, cert.Raw)
+	}
+
+	return &attestationObject{
+		Format:       "android-key",
+		AttStatement: map[string]any{"x5c": raw, "sig": c.sig},
+	}
+}
+
+func (c *androidTestChain) context(t *testing.T, roots ...*x509.Certificate) context.Context {
+	t.Helper()
+
+	var bundle []byte
+	for _, root := range roots {
+		bundle = append(bundle, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.Raw})...)
+	}
+
+	return NewProvisionerContext(context.Background(), mustAndroidAttestationProvisioner(t, bundle, nil))
+}
+
+// Test_doAndroidKeyAttestationFormat_expiredChain covers devices with
+// factory-provisioned keys. Those devices don't support key rotation and keep
+// presenting the certificates they shipped with, including the original Google
+// root that expired on 2026-05-24. Google's criterion for trusting such an
+// attestation is that the chain terminates at the published root public key and
+// that no certificate in it has been revoked, so an expired chain must still
+// validate.
+func Test_doAndroidKeyAttestationFormat_expiredChain(t *testing.T) {
+	c := mustAndroidTestChain(t)
+	require.True(t, time.Now().After(c.leaf.NotAfter), "the whole test chain should be expired")
+
+	ctx := c.context(t, c.reissuedRoot)
+	att := c.attestationObject(c.leaf, c.intermediate, c.expiredRoot)
+
+	data, err := doAndroidKeyAttestationFormat(ctx, MustProvisionerFromContext(ctx), &Challenge{Token: "token"}, c.jwk, att)
+	require.NoError(t, err)
+	assert.Equal(t, c.leaf.Raw, data.Certificate.Raw)
+	assert.Equal(t, []byte("serial-number"), data.Attestation.TeeEnforced.AttestationIdSerial)
+}
+
+// Test_doAndroidKeyAttestationFormat_chainWithoutRoot asserts a chain that
+// stops at the batch certificate, without repeating the root, still validates
+// against the root the CA trusts.
+func Test_doAndroidKeyAttestationFormat_chainWithoutRoot(t *testing.T) {
+	c := mustAndroidTestChain(t)
+
+	ctx := c.context(t, c.reissuedRoot)
+	att := c.attestationObject(c.leaf, c.intermediate)
+
+	data, err := doAndroidKeyAttestationFormat(ctx, MustProvisionerFromContext(ctx), &Challenge{Token: "token"}, c.jwk, att)
+	require.NoError(t, err)
+	assert.Equal(t, c.leaf.Raw, data.Certificate.Raw)
+}
+
+// Test_doAndroidKeyAttestationFormat_untrustedRoot asserts that dropping expiry
+// enforcement didn't drop the trust decision with it: a chain that doesn't
+// terminate at a trusted root public key is still rejected.
+func Test_doAndroidKeyAttestationFormat_untrustedRoot(t *testing.T) {
+	c := mustAndroidTestChain(t)
+	other := mustAndroidTestChain(t)
+
+	ctx := c.context(t, other.reissuedRoot)
+	att := c.attestationObject(c.leaf, c.intermediate, c.expiredRoot)
+
+	_, err := doAndroidKeyAttestationFormat(ctx, MustProvisionerFromContext(ctx), &Challenge{Token: "token"}, c.jwk, att)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "root certificate does not carry a trusted attestation root public key")
+}
+
+// Test_doAndroidKeyAttestationFormat_brokenChainSignature asserts a certificate
+// that isn't signed by the next one in the chain is rejected, even when the
+// chain ends at a trusted root.
+func Test_doAndroidKeyAttestationFormat_brokenChainSignature(t *testing.T) {
+	c := mustAndroidTestChain(t)
+	other := mustAndroidTestChain(t)
+
+	ctx := c.context(t, c.reissuedRoot)
+	// the intermediate is swapped for one from an unrelated chain, so it did
+	// not sign the leaf
+	att := c.attestationObject(c.leaf, other.intermediate, c.expiredRoot)
+
+	_, err := doAndroidKeyAttestationFormat(ctx, MustProvisionerFromContext(ctx), &Challenge{Token: "token"}, c.jwk, att)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is not signed by the next certificate in the chain")
+}
+
 func Test_doStepAttestationFormat_noCAIntermediate(t *testing.T) {
 	ctx := context.Background()
 

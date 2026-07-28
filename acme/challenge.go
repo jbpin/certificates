@@ -1480,6 +1480,77 @@ func findAndroidAttestationCert(certs []*x509.Certificate) *x509.Certificate {
 	return nil
 }
 
+// androidAttestationRoots returns the certificates trusted as Android Key
+// Attestation roots: the ones configured on the provisioner, or the roots
+// published by Google when none are configured.
+func androidAttestationRoots(prov *provisioner.ACME) ([]*x509.Certificate, error) {
+	if len(prov.AttestationRoots) > 0 {
+		roots, err := pemutil.ParseCertificateBundle(prov.AttestationRoots)
+		if err != nil {
+			return nil, WrapErrorISE(err, "error parsing attestation roots")
+		}
+		return roots, nil
+	}
+
+	rsaRoot, err := pemutil.ParseCertificate([]byte(androidRSARootCA))
+	if err != nil {
+		return nil, WrapErrorISE(err, "error parsing Android RSA root CA")
+	}
+	ecdsaRoot, err := pemutil.ParseCertificate([]byte(androidECDSARootCA))
+	if err != nil {
+		return nil, WrapErrorISE(err, "error parsing Android ECDSA root CA")
+	}
+
+	return []*x509.Certificate{rsaRoot, ecdsaRoot}, nil
+}
+
+// verifyAndroidKeyChain verifies an Android Key Attestation certificate chain,
+// ordered from leaf to root, the way Google documents it at
+// https://developer.android.com/privacy-and-security/security-key-attestation:
+// each certificate must be signed by the next one, and the root must carry the
+// public key of a trusted attestation root.
+//
+// Certificate validity periods are deliberately not enforced. Google states
+// that an attestation can be trusted when the root of the chain carries the
+// published public key and no certificate in the chain has been revoked;
+// expiry is not part of that criterion. Devices with factory-provisioned keys
+// cannot rotate their keys and keep presenting the certificates they shipped
+// with — the original Google root expired on 2026-05-24 — so enforcing expiry
+// would reject exactly the devices Google still vouches for. Revocation, which
+// is the mechanism Google does use to withdraw trust, is checked separately
+// against the attestation status list.
+func verifyAndroidKeyChain(chain, roots []*x509.Certificate) error {
+	for i := range len(chain) - 1 {
+		if err := chain[i].CheckSignatureFrom(chain[i+1]); err != nil {
+			return fmt.Errorf("certificate at index %d is not signed by the next certificate in the chain: %w", i, err)
+		}
+	}
+
+	last := chain[len(chain)-1]
+	for _, trusted := range roots {
+		// the chain normally ends at the root itself, which is trusted when it
+		// carries a trusted root public key
+		if publicKeysEqual(last.PublicKey, trusted.PublicKey) {
+			return nil
+		}
+		// a chain that omits the root is trusted when it ends at a certificate
+		// a trusted root signed
+		if err := last.CheckSignatureFrom(trusted); err == nil {
+			return nil
+		}
+	}
+
+	return errors.New("root certificate does not carry a trusted attestation root public key")
+}
+
+// publicKeysEqual reports whether two public keys are the same. Every key type
+// returned by [x509.ParseCertificate] implements the Equal method.
+func publicKeysEqual(a, b crypto.PublicKey) bool {
+	key, ok := a.(interface{ Equal(crypto.PublicKey) bool })
+
+	return ok && key.Equal(b)
+}
+
 // doAndroidKeyAttestationFormat handles ACME Device Attestation requests for
 // the "android-key" attestation format. Its verification logic is based on
 // the documentation at https://developer.android.com/privacy-and-security/security-key-attestation
@@ -1499,19 +1570,9 @@ func doAndroidKeyAttestationFormat(ctx context.Context, prov Provisioner, ch *Ch
 		return nil, NewErrorISE("provisioner in context is not an ACME provisioner")
 	}
 
-	roots, ok := prov.GetAttestationRoots()
-	if !ok {
-		rsaRoot, err := pemutil.ParseCertificate([]byte(androidRSARootCA))
-		if err != nil {
-			return nil, WrapErrorISE(err, "error parsing Android RSA root CA")
-		}
-		ecdsaRoot, err := pemutil.ParseCertificate([]byte(androidECDSARootCA))
-		if err != nil {
-			return nil, WrapErrorISE(err, "error parsing Android ECDSA root CA")
-		}
-		roots = x509.NewCertPool()
-		roots.AddCert(rsaRoot)
-		roots.AddCert(ecdsaRoot)
+	roots, err := androidAttestationRoots(acmeProv)
+	if err != nil {
+		return nil, err
 	}
 
 	// extract x5c and verify certificate
@@ -1523,9 +1584,9 @@ func doAndroidKeyAttestationFormat(ctx context.Context, prov Provisioner, ch *Ch
 		return nil, NewDetailedError(ErrorRejectedIdentifierType, "x5c is empty")
 	}
 
-	// Parse leaf, intermediates and root
-	intermediates := x509.NewCertPool()
-	var leaf, root *x509.Certificate
+	// Parse the chain, which is ordered from leaf to root, checking the
+	// revocation status of every certificate it contains.
+	certs := make([]*x509.Certificate, 0, len(x5c))
 	for i, v := range x5c {
 		der, dok := v.([]byte)
 		if !dok {
@@ -1545,52 +1606,17 @@ func doAndroidKeyAttestationFormat(ctx context.Context, prov Provisioner, ch *Ch
 			return nil, NewDetailedError(ErrorBadAttestationStatementType, "x5c element contains a revoked certificate")
 		}
 
-		switch i {
-		case 0: // leaf
-			leaf = cert
-		case len(x5c) - 1: // root
-			root = cert
-		default: // intermediates
-			intermediates.AddCert(cert)
-		}
+		certs = append(certs, cert)
 	}
 
-	// Require a leaf in the chain
-	if leaf == nil {
-		return nil, NewDetailedError(ErrorBadAttestationStatementType, "missing leaf certificate in x5c chain")
+	// A chain always carries at least the attested key and the root that
+	// vouches for it.
+	if len(certs) < 2 {
+		return nil, NewDetailedError(ErrorBadAttestationStatementType, "x5c must contain a leaf and a root certificate")
 	}
 
-	// Require a root in the chain
-	if root == nil {
-		return nil, NewDetailedError(ErrorBadAttestationStatementType, "missing root certificate in x5c chain")
-	}
-
-	// Verify the root is one of the trusted roots
-	_, err := root.Verify(x509.VerifyOptions{
-		Roots:       roots,
-		CurrentTime: time.Now().Truncate(time.Second),
-	})
-	if err != nil {
-		return nil, NewDetailedError(ErrorBadAttestationStatementType, "root certificate in chain is not trusted")
-	}
-
-	// Validate the full chain including root as trust anchor
-	chains, err := leaf.Verify(x509.VerifyOptions{
-		Intermediates: intermediates,
-		Roots:         roots,
-		CurrentTime:   time.Now().Truncate(time.Second),
-		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
-	})
-	if err != nil {
+	if err := verifyAndroidKeyChain(certs, roots); err != nil {
 		return nil, WrapDetailedError(ErrorBadAttestationStatementType, err, "x5c chain verification failed")
-	}
-
-	switch {
-	case len(chains) == 0:
-		return nil, NewDetailedError(ErrorBadAttestationStatementType, "x5c does not contain a valid certificate chain")
-	case len(chains) > 1:
-		// currently we strictly prohibit multiple valid signing chains
-		return nil, NewDetailedError(ErrorBadAttestationStatementType, "x5c contains multiple (%d) valid certificate chains", len(chains))
 	}
 
 	// Get signature
@@ -1605,7 +1631,7 @@ func doAndroidKeyAttestationFormat(ctx context.Context, prov Provisioner, ch *Ch
 	}
 
 	// Find the attestation certificate
-	attCert := findAndroidAttestationCert(chains[0])
+	attCert := findAndroidAttestationCert(certs)
 	if attCert == nil {
 		return nil, NewDetailedError(ErrorBadAttestationStatementType, "no attestation certificate with OID 1.3.6.1.4.1.11129.2.1.17 found in the cert chain")
 	}
