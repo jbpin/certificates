@@ -920,6 +920,18 @@ func TestOrder_Finalize(t *testing.T) {
 				ca: &mockSignAuth{
 					signWithContext: func(_ context.Context, _csr *x509.CertificateRequest, signOpts provisioner.SignOptions, extraOpts ...provisioner.SignOption) ([]*x509.Certificate, error) {
 						assert.Equals(t, _csr, csr)
+						// the attested facts must reach the signing webhooks
+						var got *provisioner.AttestationData
+						for _, opt := range extraOpts {
+							if data, ok := opt.(provisioner.AttestationData); ok {
+								got = &data
+							}
+						}
+						assert.Equals(t, got, &provisioner.AttestationData{
+							PermanentIdentifier: "a-permanent-identifier",
+							Format:              "android-key",
+							Android:             &webhook.AndroidAttestationData{VerifiedBootState: "Verified"},
+						})
 						return []*x509.Certificate{leaf, inter, root}, nil
 					},
 				},
@@ -935,7 +947,11 @@ func TestOrder_Finalize(t *testing.T) {
 							return &Authorization{
 								ID:          id,
 								Fingerprint: fingerprint,
-								Status:      StatusValid,
+								Attestation: &webhook.AttestationData{
+									Format:  "android-key",
+									Android: &webhook.AndroidAttestationData{VerifiedBootState: "Verified"},
+								},
+								Status: StatusValid,
 							}, nil
 						default:
 							assert.FatalError(t, errors.Errorf("unexpected authorization %s", id))
@@ -2590,7 +2606,7 @@ func TestOrder_sans(t *testing.T) {
 	}
 }
 
-func TestOrder_getAuthorizationFingerprint(t *testing.T) {
+func TestOrder_getAttestedAuthorization(t *testing.T) {
 	ctx := context.Background()
 	type fields struct {
 		AuthorizationIDs []string
@@ -2630,13 +2646,17 @@ func TestOrder_getAuthorizationFingerprint(t *testing.T) {
 			o := &Order{
 				AuthorizationIDs: tt.fields.AuthorizationIDs,
 			}
-			got, err := o.getAuthorizationFingerprint(tt.args.ctx, tt.args.db)
+			az, err := o.getAttestedAuthorization(tt.args.ctx, tt.args.db)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("Order.getAuthorizationFingerprint() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("Order.getAttestedAuthorization() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
+			var got string
+			if az != nil {
+				got = az.Fingerprint
+			}
 			if got != tt.want {
-				t.Errorf("Order.getAuthorizationFingerprint() = %v, want %v", got, tt.want)
+				t.Errorf("Order.getAttestedAuthorization() fingerprint = %v, want %v", got, tt.want)
 			}
 		})
 	}

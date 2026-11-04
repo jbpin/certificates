@@ -46,6 +46,7 @@ import (
 	"github.com/smallstep/certificates/authority/provisioner"
 	"github.com/smallstep/certificates/authority/provisioner/androidkey"
 	wireprovisioner "github.com/smallstep/certificates/authority/provisioner/wire"
+	"github.com/smallstep/certificates/webhook"
 )
 
 type mockClient struct {
@@ -152,12 +153,15 @@ func mustAttestAndroid(t *testing.T, keyAuthorization string) ([]byte, *x509.Cer
 	sig, err := signer.Sign(rand.Reader, keyAuthSum[:], crypto.SHA256)
 	require.NoError(t, err)
 
+	origin := attestation.KeyOriginGenerated
 	atts := attestation.KeyDescription{
 		AttestationVersion:       300,
 		AttestationSecurityLevel: 1,
+		KeymasterSecurityLevel:   1,
 		AttestationChallenge:     []byte(keyAuthorization),
 		TeeEnforced: attestation.AuthorizationList{
 			AttestationIdSerial: []byte("serial-number"),
+			Origin:              &origin,
 		},
 	}
 	attestByte, err := attestation.CreateKeyDescription(&atts)
@@ -3890,8 +3894,8 @@ func Test_doStepAttestationFormat(t *testing.T) {
 // root carries the same key and is what the CA trusts.
 type androidTestChain struct {
 	leaf, intermediate, expiredRoot, reissuedRoot *x509.Certificate
-	sig                                          []byte
-	jwk                                          *jose.JSONWebKey
+	sig                                           []byte
+	jwk                                           *jose.JSONWebKey
 }
 
 func mustAndroidTestChain(t *testing.T) *androidTestChain {
@@ -4795,6 +4799,13 @@ func Test_deviceAttest01Validate(t *testing.T) {
 							assert.Equal(t, "azID", id)
 							return &Authorization{ID: "azID"}, nil
 						},
+						MockUpdateAuthorization: func(ctx context.Context, az *Authorization) error {
+							require.NotNil(t, az.Attestation)
+							assert.Equal(t, "android-key", az.Attestation.Format)
+							require.NotNil(t, az.Attestation.Android)
+							assert.Equal(t, "TrustedEnvironment", az.Attestation.Android.KeymasterSecurityLevel)
+							return nil
+						},
 						MockUpdateChallenge: func(ctx context.Context, updch *Challenge) error {
 							assert.Equal(t, "chID", updch.ID)
 							assert.Equal(t, "token", updch.Token)
@@ -5640,4 +5651,96 @@ func Test_dns01ChallengeHost(t *testing.T) {
 			assert.Equal(t, tt.want, dns01ChallengeHost(tt.args.domain))
 		})
 	}
+}
+
+func Test_validateAndroidKeyProperties(t *testing.T) {
+	generated, imported := attestation.KeyOriginGenerated, attestation.KeyOriginImported
+	tests := []struct {
+		name    string
+		desc    attestation.KeyDescription
+		wantErr string
+	}{
+		{name: "ok TEE", desc: attestation.KeyDescription{
+			AttestationSecurityLevel: attestation.TrustedEnvironment,
+			KeymasterSecurityLevel:   attestation.TrustedEnvironment,
+			TeeEnforced:              attestation.AuthorizationList{Origin: &generated},
+		}},
+		{name: "ok StrongBox", desc: attestation.KeyDescription{
+			AttestationSecurityLevel: attestation.StrongBox,
+			KeymasterSecurityLevel:   attestation.StrongBox,
+			TeeEnforced:              attestation.AuthorizationList{Origin: &generated},
+		}},
+		{name: "software attestation", desc: attestation.KeyDescription{
+			AttestationSecurityLevel: attestation.Software,
+			KeymasterSecurityLevel:   attestation.TrustedEnvironment,
+			TeeEnforced:              attestation.AuthorizationList{Origin: &generated},
+		}, wantErr: "insufficient security level"},
+		{name: "software key storage", desc: attestation.KeyDescription{
+			AttestationSecurityLevel: attestation.TrustedEnvironment,
+			KeymasterSecurityLevel:   attestation.Software,
+			TeeEnforced:              attestation.AuthorizationList{Origin: &generated},
+		}, wantErr: "insufficient key storage security level"},
+		{name: "imported key", desc: attestation.KeyDescription{
+			AttestationSecurityLevel: attestation.TrustedEnvironment,
+			KeymasterSecurityLevel:   attestation.TrustedEnvironment,
+			TeeEnforced:              attestation.AuthorizationList{Origin: &imported},
+		}, wantErr: "not generated in secure hardware"},
+		{name: "origin only claimed by software", desc: attestation.KeyDescription{
+			AttestationSecurityLevel: attestation.TrustedEnvironment,
+			KeymasterSecurityLevel:   attestation.TrustedEnvironment,
+			SoftwareEnforced:         attestation.AuthorizationList{Origin: &generated},
+		}, wantErr: "not generated in secure hardware"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateAndroidKeyProperties(&tt.desc)
+			if tt.wantErr == "" {
+				assert.Nil(t, err)
+				return
+			}
+			require.NotNil(t, err)
+			assert.Contains(t, err.Detail, tt.wantErr)
+		})
+	}
+}
+
+func Test_newAndroidAttestationData(t *testing.T) {
+	patch := 202609
+	got := newAndroidAttestationData(&attestation.KeyDescription{
+		AttestationSecurityLevel: attestation.StrongBox,
+		KeymasterSecurityLevel:   attestation.TrustedEnvironment,
+		TeeEnforced: attestation.AuthorizationList{
+			OsPatchLevel: &patch,
+			RootOfTrust: &attestation.RootOfTrust{
+				DeviceLocked:      true,
+				VerifiedBootState: attestation.Verified,
+				VerifiedBootKey:   []byte("key"),
+			},
+		},
+		SoftwareEnforced: attestation.AuthorizationList{
+			// a patch level only software claims must not be reported
+			BootPatchLevel: &patch,
+			AttestationApplicationId: &attestation.AttestationApplicationId{
+				PackageInfos:     []*attestation.AttestationPackageInfo{{PackageName: "com.idruide.agent", Version: 3}},
+				SignatureDigests: [][]byte{[]byte("digest")},
+			},
+		},
+	})
+	assert.Equal(t, &webhook.AndroidAttestationData{
+		AttestationSecurityLevel: "StrongBox",
+		KeymasterSecurityLevel:   "TrustedEnvironment",
+		VerifiedBootState:        "Verified",
+		DeviceLocked:             true,
+		VerifiedBootKey:          []byte("key"),
+		OSPatchLevel:             &patch,
+		Packages:                 []webhook.AndroidPackage{{Name: "com.idruide.agent", Version: 3}},
+		SignatureDigests:         [][]byte{[]byte("digest")},
+	}, got)
+
+	// a device that attests no root of trust must not look verified, and an
+	// unexpected security level must not panic
+	got = newAndroidAttestationData(&attestation.KeyDescription{AttestationSecurityLevel: 9})
+	assert.Empty(t, got.VerifiedBootState)
+	assert.False(t, got.DeviceLocked)
+	assert.Equal(t, "Unknown", got.AttestationSecurityLevel)
 }

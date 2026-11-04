@@ -12,6 +12,7 @@ import (
 	"github.com/smallstep/assert"
 	"github.com/smallstep/certificates/acme"
 	"github.com/smallstep/certificates/db"
+	"github.com/smallstep/certificates/webhook"
 	"github.com/smallstep/nosql"
 	nosqldb "github.com/smallstep/nosql/database"
 )
@@ -554,6 +555,7 @@ func TestDB_UpdateAuthorization(t *testing.T) {
 				Wildcard:    dbaz.Wildcard,
 				ExpiresAt:   dbaz.ExpiresAt,
 				Fingerprint: "fingerprint",
+				Attestation: &webhook.AttestationData{Format: "android-key"},
 				Error:       acme.NewError(acme.ErrorMalformedType, "malformed"),
 			}
 			return test{
@@ -585,6 +587,7 @@ func TestDB_UpdateAuthorization(t *testing.T) {
 						assert.Equals(t, dbNew.CreatedAt, dbaz.CreatedAt)
 						assert.Equals(t, dbNew.ExpiresAt, dbaz.ExpiresAt)
 						assert.Equals(t, dbNew.Fingerprint, dbaz.Fingerprint)
+						assert.Equals(t, dbNew.Attestation, &webhook.AttestationData{Format: "android-key"})
 						assert.Equals(t, dbNew.Error.Error(), acme.NewError(acme.ErrorMalformedType, "The request message was malformed").Error())
 						return nu, true, nil
 					},

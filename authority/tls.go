@@ -1041,17 +1041,10 @@ func (a *Authority) callEnrichingWebhooksX509(ctx context.Context, prov provisio
 	}
 	defer func() { a.meter.X509WebhookEnriched(prov, err) }()
 
-	var attested *webhook.AttestationData
-	if attData != nil {
-		attested = &webhook.AttestationData{
-			PermanentIdentifier: attData.PermanentIdentifier,
-		}
-	}
-
 	var whEnrichReq *webhook.RequestBody
 	if whEnrichReq, err = webhook.NewRequestBody(
 		webhook.WithX509CertificateRequest(csr),
-		webhook.WithAttestationData(attested),
+		webhook.WithAttestationData(attData),
 		webhook.WithProvisionerName(prov),
 	); err == nil {
 		err = webhookCtl.Enrich(ctx, whEnrichReq)
@@ -1066,17 +1059,10 @@ func (a *Authority) callAuthorizingWebhooksX509(ctx context.Context, prov provis
 	}
 	defer func() { a.meter.X509WebhookAuthorized(prov, err) }()
 
-	var attested *webhook.AttestationData
-	if attData != nil {
-		attested = &webhook.AttestationData{
-			PermanentIdentifier: attData.PermanentIdentifier,
-		}
-	}
-
 	var whAuthBody *webhook.RequestBody
 	if whAuthBody, err = webhook.NewRequestBody(
 		webhook.WithX509Certificate(cert, leaf),
-		webhook.WithAttestationData(attested),
+		webhook.WithAttestationData(attData),
 		webhook.WithProvisionerName(prov),
 	); err == nil {
 		err = webhookCtl.Authorize(ctx, whAuthBody)

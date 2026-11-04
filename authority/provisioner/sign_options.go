@@ -21,6 +21,7 @@ import (
 	"github.com/smallstep/certificates/authority/policy"
 	"github.com/smallstep/certificates/errs"
 	"github.com/smallstep/certificates/internal/cryptoutil"
+	"github.com/smallstep/certificates/webhook"
 )
 
 // DefaultCertValidity is the default validity for a certificate if none is specified.
@@ -83,9 +84,7 @@ func (fn CertificateEnforcerFunc) Enforce(cert *x509.Certificate) error {
 
 // AttestationData is a SignOption used to pass attestation information to the
 // sign methods.
-type AttestationData struct {
-	PermanentIdentifier string
-}
+type AttestationData = webhook.AttestationData
 
 // defaultPublicKeyValidator validates the public key of a certificate request.
 type defaultPublicKeyValidator struct{}

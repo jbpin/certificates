@@ -140,25 +140,26 @@ func (o *Order) UpdateStatus(ctx context.Context, db DB) error {
 	return nil
 }
 
-// getAuthorizationFingerprint returns a fingerprint from the list of authorizations. This
-// fingerprint is used on the device-attest-01 flow to verify the attestation
-// certificate public key with the CSR public key.
+// getAttestedAuthorization returns the authorization that passed a
+// device-attest-01 challenge, or nil if there is none. Its fingerprint is used
+// to verify the attestation certificate public key with the CSR public key, and
+// its attestation data is passed on to webhooks.
 //
 // There's no point on reading all the authorizations as there will be only one
 // for a permanent identifier.
-func (o *Order) getAuthorizationFingerprint(ctx context.Context, db DB) (string, error) {
+func (o *Order) getAttestedAuthorization(ctx context.Context, db DB) (*Authorization, error) {
 	for _, azID := range o.AuthorizationIDs {
 		az, err := db.GetAuthorization(ctx, azID)
 		if err != nil {
-			return "", WrapErrorISE(err, "error getting authorization %q", azID)
+			return nil, WrapErrorISE(err, "error getting authorization %q", azID)
 		}
 		// There's no point on reading all the authorizations as there will
 		// be only one for a permanent identifier.
 		if az.Fingerprint != "" {
-			return az.Fingerprint, nil
+			return az, nil
 		}
 	}
-	return "", nil
+	return nil, nil
 }
 
 // Finalize signs a certificate if the necessary conditions for Order completion
@@ -190,16 +191,16 @@ func (o *Order) Finalize(ctx context.Context, db DB, csr *x509.CertificateReques
 	//
 	// In device-attest-01 challenges we should check that the keys in the CSR
 	// and the attestation certificate are the same.
-	fingerprint, err := o.getAuthorizationFingerprint(ctx, db)
+	attested, err := o.getAttestedAuthorization(ctx, db)
 	if err != nil {
 		return err
 	}
-	if fingerprint != "" {
+	if attested != nil {
 		fp, err := keyutil.Fingerprint(csr.PublicKey)
 		if err != nil {
 			return WrapErrorISE(err, "error calculating key fingerprint")
 		}
-		if subtle.ConstantTimeCompare([]byte(fingerprint), []byte(fp)) == 0 {
+		if subtle.ConstantTimeCompare([]byte(attested.Fingerprint), []byte(fp)) == 0 {
 			return NewError(ErrorUnauthorizedType, "order %s csr does not match the attested key", o.ID)
 		}
 	}
@@ -264,9 +265,12 @@ func (o *Order) Finalize(ctx context.Context, db DB, csr *x509.CertificateReques
 			Type:  x509util.PermanentIdentifierType,
 			Value: permanentIdentifier,
 		})
-		extraOptions = append(extraOptions, provisioner.AttestationData{
-			PermanentIdentifier: permanentIdentifier,
-		})
+		var attestationData provisioner.AttestationData
+		if attested != nil && attested.Attestation != nil {
+			attestationData = *attested.Attestation
+		}
+		attestationData.PermanentIdentifier = permanentIdentifier
+		extraOptions = append(extraOptions, attestationData)
 	} else {
 		defaultTemplate = x509util.DefaultLeafTemplate
 		sans, err := o.sans(csr)

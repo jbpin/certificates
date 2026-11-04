@@ -4,20 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/smallstep/certificates/webhook"
 )
 
 // Authorization representst an ACME Authorization.
 type Authorization struct {
-	ID          string       `json:"-"`
-	AccountID   string       `json:"-"`
-	Token       string       `json:"-"`
-	Fingerprint string       `json:"-"`
-	Identifier  Identifier   `json:"identifier"`
-	Status      Status       `json:"status"`
-	Challenges  []*Challenge `json:"challenges"`
-	Wildcard    bool         `json:"wildcard"`
-	ExpiresAt   time.Time    `json:"expires"`
-	Error       *Error       `json:"error,omitempty"`
+	ID          string                   `json:"-"`
+	AccountID   string                   `json:"-"`
+	Token       string                   `json:"-"`
+	Fingerprint string                   `json:"-"`
+	Attestation *webhook.AttestationData `json:"-"`
+	Identifier  Identifier               `json:"identifier"`
+	Status      Status                   `json:"status"`
+	Challenges  []*Challenge             `json:"challenges"`
+	Wildcard    bool                     `json:"wildcard"`
+	ExpiresAt   time.Time                `json:"expires"`
+	Error       *Error                   `json:"error,omitempty"`
 }
 
 // ToLog enables response logging.

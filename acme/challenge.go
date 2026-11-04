@@ -43,6 +43,7 @@ import (
 	"github.com/smallstep/certificates/authority/provisioner"
 	wireprovisioner "github.com/smallstep/certificates/authority/provisioner/wire"
 	"github.com/smallstep/certificates/internal/cast"
+	"github.com/smallstep/certificates/webhook"
 )
 
 type ChallengeType string
@@ -857,9 +858,9 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 			return WrapErrorISE(err, "error validating attestation")
 		}
 
-		// Enforce hardware security level (TrustedEnvironment or StrongBox; Software not allowed)
-		if data.Attestation.AttestationSecurityLevel < 1 {
-			return storeError(ctx, db, ch, true, NewDetailedError(ErrorBadAttestationStatementType, "insufficient security level: %d", data.Attestation.AttestationSecurityLevel))
+		// Enforce that the key was generated in, and stays in, secure hardware.
+		if err := validateAndroidKeyProperties(data.Attestation); err != nil {
+			return storeError(ctx, db, ch, true, err)
 		}
 
 		// Enforce hardware backed device serial
@@ -874,6 +875,7 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 
 		// Update attestation key fingerprint to compare against the CSR
 		az.Fingerprint = data.Fingerprint
+		az.Attestation = &webhook.AttestationData{Format: format, Android: newAndroidAttestationData(data.Attestation)}
 	case "apple":
 		data, err := doAppleAttestationFormat(ctx, prov, ch, &att)
 		if err != nil {
@@ -909,6 +911,7 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 
 		// Update attestation key fingerprint to compare against the CSR
 		az.Fingerprint = data.Fingerprint
+		az.Attestation = &webhook.AttestationData{Format: format, Apple: &webhook.AppleAttestationData{NonceVerified: len(data.Nonce) != 0, SEPVersion: data.SEPVersion}}
 	case "step":
 		data, err := doStepAttestationFormat(ctx, prov, ch, jwk, &att)
 		if err != nil {
@@ -936,6 +939,7 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 
 		// Update attestation key fingerprint to compare against the CSR
 		az.Fingerprint = data.Fingerprint
+		az.Attestation = &webhook.AttestationData{Format: format}
 
 	case "tpm":
 		data, err := doTPMAttestationFormat(ctx, prov, ch, jwk, &att)
@@ -965,6 +969,7 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 
 		// Update attestation key fingerprint to compare against the CSR
 		az.Fingerprint = data.Fingerprint
+		az.Attestation = &webhook.AttestationData{Format: format}
 	default:
 		return storeError(ctx, db, ch, true, NewDetailedError(ErrorBadAttestationStatementType, "unsupported attestation object format %q", format))
 	}
@@ -1541,6 +1546,77 @@ func publicKeysEqual(a, b crypto.PublicKey) bool {
 	key, ok := a.(interface{ Equal(crypto.PublicKey) bool })
 
 	return ok && key.Equal(b)
+}
+
+// validateAndroidKeyProperties rejects keys that secure hardware does not vouch
+// for: an attestation produced outside of it, a key stored outside of it, or a
+// key that was imported instead of generated there.
+func validateAndroidKeyProperties(desc *attestation.KeyDescription) *Error {
+	if desc.AttestationSecurityLevel < attestation.TrustedEnvironment {
+		return NewDetailedError(ErrorBadAttestationStatementType, "insufficient security level: %d", desc.AttestationSecurityLevel)
+	}
+	if desc.KeymasterSecurityLevel < attestation.TrustedEnvironment {
+		return NewDetailedError(ErrorBadAttestationStatementType, "insufficient key storage security level: %d", desc.KeymasterSecurityLevel)
+	}
+	if origin := desc.TeeEnforced.Origin; origin == nil || *origin != attestation.KeyOriginGenerated {
+		return NewDetailedError(ErrorBadAttestationStatementType, "attested key was not generated in secure hardware")
+	}
+	return nil
+}
+
+// androidSecurityLevel names a security level. The name is looked up here
+// because the library's String method panics on values outside of the enum.
+func androidSecurityLevel(level attestation.SecurityLevel) string {
+	switch level {
+	case attestation.Software:
+		return "Software"
+	case attestation.TrustedEnvironment:
+		return "TrustedEnvironment"
+	case attestation.StrongBox:
+		return "StrongBox"
+	default:
+		return "Unknown"
+	}
+}
+
+// newAndroidAttestationData extracts the facts webhooks can apply a device
+// policy to. The hardware enforced authorization list is the source of every
+// fact, except for the app identity which only Android can report.
+func newAndroidAttestationData(desc *attestation.KeyDescription) *webhook.AndroidAttestationData {
+	hw := desc.TeeEnforced
+	data := &webhook.AndroidAttestationData{
+		AttestationSecurityLevel: androidSecurityLevel(desc.AttestationSecurityLevel),
+		KeymasterSecurityLevel:   androidSecurityLevel(desc.KeymasterSecurityLevel),
+		OSVersion:                hw.OsVersion,
+		OSPatchLevel:             hw.OsPatchLevel,
+		VendorPatchLevel:         hw.VendorPatchLevel,
+		BootPatchLevel:           hw.BootPatchLevel,
+	}
+	if rot := hw.RootOfTrust; rot != nil {
+		data.DeviceLocked = rot.DeviceLocked
+		data.VerifiedBootKey = rot.VerifiedBootKey
+		switch rot.VerifiedBootState {
+		case attestation.Verified:
+			data.VerifiedBootState = "Verified"
+		case attestation.SelfSigned:
+			data.VerifiedBootState = "SelfSigned"
+		case attestation.Unverified:
+			data.VerifiedBootState = "Unverified"
+		case attestation.Failed:
+			data.VerifiedBootState = "Failed"
+		default:
+			data.VerifiedBootState = "Unknown"
+		}
+	}
+	if app := desc.SoftwareEnforced.AttestationApplicationId; app != nil {
+		data.SignatureDigests = app.SignatureDigests
+		for _, pkg := range app.PackageInfos {
+			if pkg != nil {
+				data.Packages = append(data.Packages, webhook.AndroidPackage{Name: pkg.PackageName, Version: pkg.Version})
+			}
+		}
+	}
+	return data
 }
 
 // doAndroidKeyAttestationFormat handles ACME Device Attestation requests for

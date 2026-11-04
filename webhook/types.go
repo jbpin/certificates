@@ -67,6 +67,47 @@ type SSHCertificate struct {
 // AttestationData is data validated by acme device-attest-01 challenge
 type AttestationData struct {
 	PermanentIdentifier string `json:"permanentIdentifier"`
+	// Format is the attestation format the device used, e.g. "android-key".
+	Format string `json:"format,omitempty"`
+	// Android and Apple carry the attested facts of those formats, so webhooks
+	// can apply a device policy. They are only as trustworthy as the
+	// attestation that device-attest-01 verified.
+	Android *AndroidAttestationData `json:"android,omitempty"`
+	Apple   *AppleAttestationData   `json:"apple,omitempty"`
+}
+
+// AndroidAttestationData holds the facts of an Android Key Attestation. Facts
+// the device did not attest are left empty, and a webhook enforcing them should
+// treat that as a failure.
+type AndroidAttestationData struct {
+	AttestationSecurityLevel string `json:"attestationSecurityLevel"`
+	KeymasterSecurityLevel   string `json:"keymasterSecurityLevel"`
+	VerifiedBootState        string `json:"verifiedBootState,omitempty"`
+	DeviceLocked             bool   `json:"deviceLocked"`
+	VerifiedBootKey          []byte `json:"verifiedBootKey,omitempty"`
+	OSVersion                *int   `json:"osVersion,omitempty"`
+	OSPatchLevel             *int   `json:"osPatchLevel,omitempty"`
+	VendorPatchLevel         *int   `json:"vendorPatchLevel,omitempty"`
+	BootPatchLevel           *int   `json:"bootPatchLevel,omitempty"`
+	// Packages and SignatureDigests identify the app that created the key. They
+	// are reported by Android rather than the secure hardware, so they are only
+	// meaningful on a device with a verified boot state.
+	Packages         []AndroidPackage `json:"packages,omitempty"`
+	SignatureDigests [][]byte         `json:"signatureDigests,omitempty"`
+}
+
+// AndroidPackage is an app allowed to use an attested key.
+type AndroidPackage struct {
+	Name    string `json:"name"`
+	Version int    `json:"version"`
+}
+
+// AppleAttestationData holds the facts of an Apple device attestation.
+type AppleAttestationData struct {
+	// NonceVerified is true when the attestation carried a nonce matching the
+	// challenge token. Otherwise the attestation may not be fresh.
+	NonceVerified bool   `json:"nonceVerified"`
+	SEPVersion    string `json:"sepVersion,omitempty"`
 }
 
 // X5CCertificate is the authorization certificate sent to webhook servers for
