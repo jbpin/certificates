@@ -1,10 +1,13 @@
-FROM golang:alpine AS builder
+# The builder runs on the build host's own architecture and cross-compiles for
+# the target: Go crashes when built under QEMU user emulation.
+FROM --platform=$BUILDPLATFORM golang:alpine AS builder
+ARG TARGETOS TARGETARCH
 
 WORKDIR /src
 COPY . .
 
 RUN apk add --no-cache curl git make libcap
-RUN make V=1 bin/step-ca
+RUN make V=1 GOOS_OVERRIDE="GOOS=$TARGETOS GOARCH=$TARGETARCH" bin/step-ca
 RUN setcap CAP_NET_BIND_SERVICE=+eip bin/step-ca
 
 FROM smallstep/step-kms-plugin:cloud AS kms
