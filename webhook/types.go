@@ -69,11 +69,20 @@ type AttestationData struct {
 	PermanentIdentifier string `json:"permanentIdentifier"`
 	// Format is the attestation format the device used, e.g. "android-key".
 	Format string `json:"format,omitempty"`
-	// Android and Apple carry the attested facts of those formats, so webhooks
-	// can apply a device policy. They are only as trustworthy as the
+	// Android, Apple and TPM carry the attested facts of those formats, so
+	// webhooks can apply a device policy. They are only as trustworthy as the
 	// attestation that device-attest-01 verified.
 	Android *AndroidAttestationData `json:"android,omitempty"`
 	Apple   *AppleAttestationData   `json:"apple,omitempty"`
+	TPM     *TPMAttestationData     `json:"tpm,omitempty"`
+}
+
+// TPMAttestationData holds the TPM hardware details from the Subject
+// Alternative Name of the verified AK certificate.
+type TPMAttestationData struct {
+	Manufacturer string `json:"manufacturer"`
+	Model        string `json:"model"`
+	Version      string `json:"version"`
 }
 
 // AndroidAttestationData holds the facts of an Android Key Attestation. Facts

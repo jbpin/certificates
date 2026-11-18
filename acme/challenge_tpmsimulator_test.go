@@ -28,6 +28,8 @@ import (
 	"go.step.sm/crypto/tpm/simulator"
 	tpmstorage "go.step.sm/crypto/tpm/storage"
 	"go.step.sm/crypto/x509util"
+
+	"github.com/smallstep/certificates/webhook"
 )
 
 func newSimulatedTPM(t *testing.T) *tpm.TPM {
@@ -329,6 +331,9 @@ func Test_deviceAttest01ValidateWithTPMSimulator(t *testing.T) {
 							assert.NoError(t, err)
 							assert.Equal(t, "azID", az.ID)
 							assert.Equal(t, fingerprint, az.Fingerprint)
+							assert.Equal(t, &webhook.AttestationData{Format: "tpm", TPM: &webhook.TPMAttestationData{
+								Manufacturer: "1414747215", Model: "SLB 9670 TPM2.0", Version: "7.55",
+							}}, az.Attestation)
 							return nil
 						},
 						MockUpdateChallenge: func(ctx context.Context, updch *Challenge) error {
@@ -372,6 +377,9 @@ func Test_deviceAttest01ValidateWithTPMSimulator(t *testing.T) {
 							assert.NoError(t, err)
 							assert.Equal(t, "azID", az.ID)
 							assert.Equal(t, fingerprint, az.Fingerprint)
+							assert.Equal(t, &webhook.AttestationData{Format: "tpm", TPM: &webhook.TPMAttestationData{
+								Manufacturer: "1414747215", Model: "SLB 9670 TPM2.0", Version: "7.55",
+							}}, az.Attestation)
 							return nil
 						},
 						MockUpdateChallenge: func(ctx context.Context, updch *Challenge) error {

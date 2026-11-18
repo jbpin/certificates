@@ -19,8 +19,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/url"
+	"os"
 	"reflect"
 	"slices"
 	"strconv"
@@ -789,8 +791,23 @@ type attestationObject struct {
 	AttStatement map[string]any `json:"attStmt,omitempty"`
 }
 
+// attestationLog writes one JSON line per device-attest-01 challenge step-ca
+// rejects, as no webhook sees those.
+var attestationLog = slog.New(slog.NewJSONHandler(os.Stderr, nil))
+
 // TODO(bweeks): move attestation verification to a shared package.
 func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebKey, payload []byte) error {
+	var format string
+	defer func() {
+		// Validate only runs on pending challenges, so invalid means storeError rejected it here.
+		if ch.Status == StatusInvalid && ch.Error != nil {
+			attestationLog.WarnContext(ctx, "attestation rejected",
+				"challengeID", ch.ID, "authorizationID", ch.AuthorizationID, "accountID", ch.AccountID,
+				"type", ch.Type, "format", format, "value", ch.Value,
+				"errorType", ch.Error.Type, "detail", ch.Error.Detail, "error", ch.Error.Error())
+		}
+	}()
+
 	// Update challenge with the payload
 	ch.Payload = payload
 
@@ -834,7 +851,7 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 		return WrapErrorISE(err, "failed unmarshalling CBOR")
 	}
 
-	format := att.Format
+	format = att.Format
 	prov := MustProvisionerFromContext(ctx)
 	if !prov.IsAttestationFormatEnabled(ctx, provisioner.ACMEAttestationFormat(format)) {
 		if format != "apple" && format != "step" && format != "tpm" && format != "android-key" {
@@ -969,7 +986,8 @@ func deviceAttest01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose
 
 		// Update attestation key fingerprint to compare against the CSR
 		az.Fingerprint = data.Fingerprint
-		az.Attestation = &webhook.AttestationData{Format: format}
+		hw := data.HardwareDetails
+		az.Attestation = &webhook.AttestationData{Format: format, TPM: &webhook.TPMAttestationData{Manufacturer: hw.Manufacturer, Model: hw.Model, Version: hw.Version}}
 	default:
 		return storeError(ctx, db, ch, true, NewDetailedError(ErrorBadAttestationStatementType, "unsupported attestation object format %q", format))
 	}
@@ -1003,6 +1021,7 @@ type tpmAttestationData struct {
 	Certificate          *x509.Certificate
 	VerifiedChains       [][]*x509.Certificate
 	PermanentIdentifiers []string
+	HardwareDetails      x509util.TPMHardwareDetails
 	Fingerprint          string
 }
 
@@ -1201,6 +1220,7 @@ func doTPMAttestationFormat(_ context.Context, prov Provisioner, ch *Challenge, 
 		Certificate:          akCert,
 		VerifiedChains:       verifiedChains,
 		PermanentIdentifiers: permanentIdentifiers,
+		HardwareDetails:      sans.TPMHardwareDetails,
 	}
 
 	if data.Fingerprint, err = keyutil.Fingerprint(publicKey); err != nil {

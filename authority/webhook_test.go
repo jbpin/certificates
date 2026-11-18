@@ -12,6 +12,7 @@ type mockWebhookController struct {
 	authorizeErr error
 	templateData provisioner.WebhookSetter
 	respData     map[string]any
+	authorized   *webhook.RequestBody
 }
 
 var _ webhookController = &mockWebhookController{}
@@ -24,6 +25,7 @@ func (wc *mockWebhookController) Enrich(context.Context, *webhook.RequestBody) e
 	return wc.enrichErr
 }
 
-func (wc *mockWebhookController) Authorize(context.Context, *webhook.RequestBody) error {
+func (wc *mockWebhookController) Authorize(_ context.Context, req *webhook.RequestBody) error {
+	wc.authorized = req
 	return wc.authorizeErr
 }

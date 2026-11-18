@@ -13,6 +13,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"net/http"
 	"reflect"
 	"strings"
@@ -2149,6 +2150,46 @@ func (notImplementedCAS) RenewCertificate(req *apiv1.RenewCertificateRequest) (*
 }
 func (notImplementedCAS) RevokeCertificate(req *apiv1.RevokeCertificateRequest) (*apiv1.RevokeCertificateResponse, error) {
 	return nil, apiv1.NotImplementedError{}
+}
+
+// reserialCAS signs with its own serial, like a remote CAS would.
+type reserialCAS struct {
+	apiv1.CertificateAuthorityService
+}
+
+func (c reserialCAS) CreateCertificate(req *apiv1.CreateCertificateRequest) (*apiv1.CreateCertificateResponse, error) {
+	req.Template.SerialNumber = big.NewInt(1)
+	return c.CertificateAuthorityService.CreateCertificate(req)
+}
+
+func TestAuthority_SignWithContext_webhookSerial(t *testing.T) {
+	_, priv, err := keyutil.GenerateDefaultKeyPair()
+	require.NoError(t, err)
+	a := testAuthority(t)
+	a.db = &db.MockAuthDB{MStoreCertificate: func(*x509.Certificate) error { return nil }}
+	signOpts := provisioner.SignOptions{NotAfter: provisioner.NewTimeDuration(time.Now().Add(time.Hour))}
+
+	// The authorizing webhook sees the serial the certificate is signed with.
+	wc := &mockWebhookController{}
+	chain, err := a.SignWithContext(context.Background(), getCSR(t, priv), signOpts, wc)
+	require.NoError(t, err)
+	require.NotNil(t, wc.authorized)
+	require.NotNil(t, wc.authorized.X509Certificate.SerialNumber.Int)
+	assert.Zero(t, chain[0].SerialNumber.Cmp(wc.authorized.X509Certificate.SerialNumber.Int))
+
+	// A CAS that ignores that serial must not issue.
+	a.x509CAService = reserialCAS{a.x509CAService}
+	_, err = a.SignWithContext(context.Background(), getCSR(t, priv), signOpts, &mockWebhookController{})
+	assert.ErrorContains(t, err, "serial number differs")
+
+	// Without webhooks the CAS serial is kept, as before. Provisioners always
+	// pass a controller, so test both a nil one and one with no webhooks.
+	chain, err = a.SignWithContext(context.Background(), getCSR(t, priv), signOpts)
+	require.NoError(t, err)
+	assert.Equal(t, big.NewInt(1), chain[0].SerialNumber)
+	chain, err = a.SignWithContext(context.Background(), getCSR(t, priv), signOpts, &provisioner.WebhookController{})
+	require.NoError(t, err)
+	assert.Equal(t, big.NewInt(1), chain[0].SerialNumber)
 }
 
 func TestAuthority_GetX509Signer(t *testing.T) {

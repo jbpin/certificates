@@ -3,6 +3,7 @@ package authority
 import (
 	"context"
 	"crypto"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -308,6 +309,10 @@ func (a *Authority) signX509(ctx context.Context, csr *x509.CertificateRequest, 
 	})
 	if err != nil {
 		return nil, prov, errs.Wrap(http.StatusInternalServerError, err, "authority.Sign; error creating certificate", opts...)
+	}
+	// Authorizing webhooks were sent this serial: a CAS that picks its own must not issue.
+	if hasAuthorizingWebhook(webhookCtl) && resp.Certificate.SerialNumber.Cmp(crt.SerialNumber.Int) != 0 {
+		return nil, prov, errs.Wrap(http.StatusInternalServerError, errors.New("serial number differs from the one sent to webhooks"), "authority.Sign; error creating certificate", opts...)
 	}
 
 	chain := append([]*x509.Certificate{resp.Certificate}, resp.CertificateChain...)
@@ -1058,6 +1063,17 @@ func (a *Authority) callAuthorizingWebhooksX509(ctx context.Context, prov provis
 		return
 	}
 	defer func() { a.meter.X509WebhookAuthorized(prov, err) }()
+
+	// Pick the serial now so webhooks see the final one; the CAS signs with a
+	// preset serial (x509util.CreateCertificate only generates a missing one).
+	if hasAuthorizingWebhook(webhookCtl) {
+		if leaf.SerialNumber == nil {
+			if leaf.SerialNumber, err = rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128)); err != nil {
+				return
+			}
+		}
+		cert.SerialNumber = x509util.SerialNumber{Int: leaf.SerialNumber}
+	}
 
 	var whAuthBody *webhook.RequestBody
 	if whAuthBody, err = webhook.NewRequestBody(

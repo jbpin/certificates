@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -5743,4 +5744,36 @@ func Test_newAndroidAttestationData(t *testing.T) {
 	assert.Empty(t, got.VerifiedBootState)
 	assert.False(t, got.DeviceLocked)
 	assert.Equal(t, "Unknown", got.AttestationSecurityLevel)
+}
+
+func Test_deviceAttest01Validate_logsRejection(t *testing.T) {
+	var buf bytes.Buffer
+	defer func(l *slog.Logger) { attestationLog = l }(attestationLog)
+	attestationLog = slog.New(slog.NewJSONHandler(&buf, nil))
+
+	attObj, err := cbor.Marshal(struct {
+		Format string `json:"fmt"`
+	}{Format: "tpm"})
+	require.NoError(t, err)
+	payload, err := json.Marshal(struct {
+		AttObj string `json:"attObj"`
+	}{AttObj: base64.RawURLEncoding.EncodeToString(attObj)})
+	require.NoError(t, err)
+
+	ctx := NewProvisionerContext(context.Background(), mustNonAttestationProvisioner(t))
+	ch := &Challenge{ID: "chID", AuthorizationID: "azID", AccountID: "accID", Type: DEVICEATTEST01, Status: StatusPending, Value: "12345678"}
+	db := &MockDB{
+		MockGetAuthorization: func(context.Context, string) (*Authorization, error) { return &Authorization{ID: "azID"}, nil },
+		MockUpdateChallenge:  func(context.Context, *Challenge) error { return nil },
+	}
+	require.NoError(t, deviceAttest01Validate(ctx, ch, db, nil, payload))
+
+	var line map[string]any
+	require.NoError(t, json.Unmarshal(buf.Bytes(), &line))
+	assert.Equal(t, "attestation rejected", line["msg"])
+	assert.Equal(t, "chID", line["challengeID"])
+	assert.Equal(t, "accID", line["accountID"])
+	assert.Equal(t, "tpm", line["format"])
+	assert.Equal(t, "12345678", line["value"])
+	assert.Equal(t, `attestation format "tpm" is not enabled`, line["error"])
 }

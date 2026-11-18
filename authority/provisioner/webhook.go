@@ -120,6 +120,20 @@ func (wc *WebhookController) Authorize(ctx context.Context, req *webhook.Request
 	return nil
 }
 
+// HasAuthorizing reports whether an authorizing webhook applies to this
+// controller's certificate type.
+func (wc *WebhookController) HasAuthorizing() bool {
+	if wc == nil {
+		return false
+	}
+	for _, wh := range wc.webhooks {
+		if wh.Kind == linkedca.Webhook_AUTHORIZING.String() && wc.isCertTypeOK(wh) {
+			return true
+		}
+	}
+	return false
+}
+
 func (wc *WebhookController) isCertTypeOK(wh *Webhook) bool {
 	if wc.certType == linkedca.Webhook_ALL {
 		return true
