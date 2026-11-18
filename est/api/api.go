@@ -274,6 +274,14 @@ func authorizeEnrollRequest(ctx context.Context, csr *x509.CertificateRequest) (
 		CAIntermediates: ca.GetIntermediateCertificates(),
 	}
 	if cert, ok := est.ClientCertificateFromContext(ctx); ok {
+		// A revoked certificate cannot renew itself.
+		revoked, err := ca.IsRevoked(cert.SerialNumber.String())
+		if err != nil {
+			return nil, fmt.Errorf("failed checking client certificate revocation: %w", err)
+		}
+		if revoked {
+			return nil, provisioner.ErrESTAuthDenied
+		}
 		req.ClientCertificate = cert
 		req.ClientCertificateChain, _ = est.ClientCertificateChainFromContext(ctx)
 	}

@@ -48,31 +48,53 @@ func mustESTTestCert(t *testing.T, cn string, isCA bool, parent *x509.Certificat
 
 func TestEST_authorizeWithWebhook(t *testing.T) {
 	root, rootKey := mustESTTestCert(t, "root", true, nil, nil)
-	trusted, _ := mustESTTestCert(t, "trusted", false, root, rootKey)
+	trusted, deviceKey := mustESTTestCert(t, "device", false, root, rootKey)
 	otherRoot, otherKey := mustESTTestCert(t, "other", true, nil, nil)
-	untrusted, _ := mustESTTestCert(t, "untrusted", false, otherRoot, otherKey)
+	untrusted, _ := mustESTTestCert(t, "device", false, otherRoot, otherKey)
 	rootPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.Raw})
 	pool := x509.NewCertPool()
 	pool.AddCert(root)
-	csr := &x509.CertificateRequest{Subject: pkix.Name{CommonName: "device"}}
+	mkCSR := func(key *ecdsa.PrivateKey, cn string, dns ...string) *x509.CertificateRequest {
+		der, err := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: cn}, DNSNames: dns}, key)
+		require.NoError(t, err)
+		csr, err := x509.ParseCertificateRequest(der)
+		require.NoError(t, err)
+		return csr
+	}
+	csr := mkCSR(deviceKey, "device")
+	otherCSR := mkCSR(deviceKey, "another-device")
+	sanCSR := mkCSR(deviceKey, "device", "another-device")
+	foreignKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	foreignKeyCSR := mkCSR(foreignKey, "device") // e.g. a public certificate pasted in a forged forwarded header
 	enabled, disabled := true, false
 
 	tests := []struct {
 		name              string
 		enabled           *bool
+		csr               *x509.CertificateRequest
 		req               ESTAuthRequest
 		wantCalled        bool
-		wantClientCert    bool
 		wantBearer        string
+		wantLocalAllow    bool
 		wantDeniedLocally bool
 	}{
-		{name: "verified certificate reaches the webhook", enabled: &enabled,
-			req: ESTAuthRequest{ClientCertificate: trusted}, wantCalled: true, wantClientCert: true},
-		{name: "certificate and bearer token are both forwarded", enabled: &enabled,
-			req:        ESTAuthRequest{ClientCertificate: trusted, AuthenticationHeader: "Bearer jwt", BearerToken: "jwt"},
-			wantCalled: true, wantClientCert: true, wantBearer: "jwt"},
+		{name: "verified certificate renews without the webhook", enabled: &enabled,
+			req: ESTAuthRequest{ClientCertificate: trusted}, wantLocalAllow: true},
+		{name: "verified certificate wins over a (stale) bearer token", enabled: &enabled,
+			req:            ESTAuthRequest{ClientCertificate: trusted, AuthenticationHeader: "Bearer jwt", BearerToken: "jwt"},
+			wantLocalAllow: true},
+		{name: "verified certificate cannot renew another subject", enabled: &enabled, csr: otherCSR,
+			req: ESTAuthRequest{ClientCertificate: trusted, AuthenticationHeader: "Bearer jwt", BearerToken: "jwt"}, wantDeniedLocally: true},
+		{name: "verified certificate cannot add a SAN", enabled: &enabled, csr: sanCSR,
+			req: ESTAuthRequest{ClientCertificate: trusted}, wantDeniedLocally: true},
+		{name: "verified certificate cannot renew for a key it does not prove", enabled: &enabled, csr: foreignKeyCSR,
+			req: ESTAuthRequest{ClientCertificate: trusted, AuthenticationHeader: "Bearer jwt", BearerToken: "jwt"}, wantDeniedLocally: true},
 		{name: "untrusted certificate is dropped but the token still authenticates", enabled: &enabled,
 			req:        ESTAuthRequest{ClientCertificate: untrusted, AuthenticationHeader: "Bearer jwt", BearerToken: "jwt"},
+			wantCalled: true, wantBearer: "jwt"},
+		{name: "token alone goes to the webhook", enabled: &enabled,
+			req:        ESTAuthRequest{AuthenticationHeader: "Bearer jwt", BearerToken: "jwt"},
 			wantCalled: true, wantBearer: "jwt"},
 		{name: "untrusted certificate alone never reaches the webhook", enabled: &enabled,
 			req: ESTAuthRequest{ClientCertificate: untrusted}, wantDeniedLocally: true},
@@ -101,19 +123,27 @@ func TestEST_authorizeWithWebhook(t *testing.T) {
 				},
 			}
 			tt.req.CSR = csr
+			if tt.csr != nil {
+				tt.req.CSR = tt.csr
+			}
 
 			opts, err := s.AuthorizeRequest(context.Background(), tt.req)
-			if tt.wantDeniedLocally {
+			switch {
+			case tt.wantDeniedLocally:
 				assert.True(t, errors.Is(err, ErrESTAuthDenied), "got %v", err)
 				assert.Nil(t, got, "webhook must not be called")
-				return
+			case tt.wantLocalAllow:
+				require.NoError(t, err)
+				assert.Empty(t, opts)
+				assert.Nil(t, got, "webhook must not be called")
+			default:
+				require.NoError(t, err)
+				assert.Len(t, opts, 1)
+				require.NotNil(t, got)
+				assert.Nil(t, got.ClientCertificate)
+				assert.Equal(t, tt.wantBearer, got.BearerToken)
+				assert.Equal(t, "est", got.ProvisionerName)
 			}
-			require.NoError(t, err)
-			assert.Len(t, opts, 1)
-			require.NotNil(t, got)
-			assert.Equal(t, tt.wantClientCert, got.ClientCertificate != nil)
-			assert.Equal(t, tt.wantBearer, got.BearerToken)
-			assert.Equal(t, "est", got.ProvisionerName)
 		})
 	}
 }

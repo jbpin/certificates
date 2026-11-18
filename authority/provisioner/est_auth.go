@@ -1,12 +1,14 @@
 package provisioner
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/smallstep/certificates/webhook"
 	"go.step.sm/crypto/x509util"
@@ -46,7 +48,22 @@ func (s *EST) GetClientCertificateConfig() *ClientCertificateConfig {
 }
 
 // AuthorizeRequest validates the request against configured EST auth methods.
+//
+// A client that already holds a certificate this provisioner accepts renews
+// with it: the certificate is the authentication and the challenge webhooks
+// (enrollment token) are only for first issuance. The CSR must carry the
+// certificate's public key, so its signature proves possession of that key: a
+// certificate is public and may arrive in a forwarded header that the client
+// itself wrote. It must also name exactly the certificate's identity, so one
+// device cannot renew as another. A new key means enrolling again.
+// Revocation of the client certificate is checked by the caller (est/api).
 func (s *EST) AuthorizeRequest(ctx context.Context, req ESTAuthRequest) ([]SignCSROption, error) {
+	if req.ClientCertificate != nil && s.verifyClientCertificate(req) == nil {
+		if !csrMatchesCertificate(req.CSR, req.ClientCertificate) {
+			return nil, ErrESTAuthDenied
+		}
+		return []SignCSROption{}, nil
+	}
 	if s.hasAuthWebhooks() {
 		return s.authorizeWithWebhook(ctx, &req)
 	}
@@ -109,22 +126,15 @@ func (s *EST) authorizeWithWebhook(ctx context.Context, req *ESTAuthRequest) ([]
 		return nil, ErrESTAuthMethodMisconfigured
 	}
 
-	// Behind a reverse proxy the client certificate comes from a request
-	// header, so webhooks only ever receive one that has been verified here. A
-	// certificate that fails verification is dropped rather than rejected, as
-	// the request can still authenticate with its Authorization header.
-	bodyOpts := []webhook.RequestBodyOption{webhook.WithX509CertificateRequest(req.CSR)}
-	hasCredential := false
-	if req.ClientCertificate != nil && s.verifyClientCertificate(*req) == nil {
-		bodyOpts = append(bodyOpts, webhook.WithClientCertificate(req.ClientCertificate))
-		hasCredential = true
-	}
-	if req.AuthenticationHeader != "" {
-		bodyOpts = append(bodyOpts, webhook.WithAuthenticationHeader(req.AuthenticationHeader))
-		hasCredential = true
-	}
-	if !hasCredential {
+	// A verified client certificate never gets here (AuthorizeRequest); one
+	// that fails verification is dropped, as the request can still
+	// authenticate with its Authorization header.
+	if req.AuthenticationHeader == "" {
 		return nil, ErrESTAuthDenied
+	}
+	bodyOpts := []webhook.RequestBodyOption{
+		webhook.WithX509CertificateRequest(req.CSR),
+		webhook.WithAuthenticationHeader(req.AuthenticationHeader),
 	}
 
 	whreq, err := webhook.NewRequestBody(bodyOpts...)
@@ -152,6 +162,34 @@ func (s *EST) authorizeWithWebhook(ctx context.Context, req *ESTAuthRequest) ([]
 	}
 
 	return opts, nil
+}
+
+// csrMatchesCertificate reports whether the CSR asks for the same key, subject
+// and SANs as the certificate. The CSR signature is checked by the caller.
+func csrMatchesCertificate(csr *x509.CertificateRequest, cert *x509.Certificate) bool {
+	if csr == nil || !bytes.Equal(csr.RawSubjectPublicKeyInfo, cert.RawSubjectPublicKeyInfo) ||
+		csr.Subject.String() != cert.Subject.String() {
+		return false
+	}
+	return sameStrings(csr.DNSNames, cert.DNSNames) &&
+		sameStrings(csr.EmailAddresses, cert.EmailAddresses) &&
+		sameStrings(stringsOf(csr.IPAddresses), stringsOf(cert.IPAddresses)) &&
+		sameStrings(stringsOf(csr.URIs), stringsOf(cert.URIs))
+}
+
+func stringsOf[T fmt.Stringer](in []T) []string {
+	out := make([]string, len(in))
+	for i, v := range in {
+		out[i] = v.String()
+	}
+	return out
+}
+
+func sameStrings(a, b []string) bool {
+	a, b = slices.Clone(a), slices.Clone(b)
+	slices.Sort(a)
+	slices.Sort(b)
+	return slices.Equal(a, b)
 }
 
 // hasBasicAuth reports whether any basic auth data is present.
