@@ -173,7 +173,7 @@ func enrollHandler(w http.ResponseWriter, r *http.Request) {
 
 	issued, err := auth.SignCSR(ctx, csr, opts...)
 	if err != nil {
-		failWithStatus(w, r, http.StatusInternalServerError, fmt.Errorf("failed issuing certificate: %w", err))
+		failSign(w, r, err)
 		return
 	}
 
@@ -366,6 +366,19 @@ func writeResponse(w http.ResponseWriter, data []byte, contentType string, statu
 func fail(w http.ResponseWriter, r *http.Request, err error) {
 	log.Error(w, r, err)
 	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+// failSign answers a signing error. A refusal (a webhook said no, a policy
+// forbids it) is the client's outcome, not a server fault: 403 with a generic
+// body, the reason stays in the CA log and in the webhook's own audit line.
+func failSign(w http.ResponseWriter, r *http.Request, err error) {
+	var sc interface{ StatusCode() int }
+	if errors.As(err, &sc) && sc.StatusCode() == http.StatusForbidden {
+		log.Error(w, r, err)
+		http.Error(w, "certificate request denied", http.StatusForbidden)
+		return
+	}
+	failWithStatus(w, r, http.StatusInternalServerError, fmt.Errorf("failed issuing certificate: %w", err))
 }
 
 func failWithStatus(w http.ResponseWriter, r *http.Request, status int, err error) {

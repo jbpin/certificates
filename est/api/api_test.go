@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/smallstep/certificates/errs"
 )
 
 func Test_writeResponse(t *testing.T) {
@@ -114,6 +118,26 @@ func Test_parseForwardedClientCertificates(t *testing.T) {
 			for i, serial := range tt.wantSerial {
 				require.Equal(t, serial, certs[i].SerialNumber.Int64())
 			}
+		})
+	}
+}
+
+func Test_failSign(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		wantCode int
+		wantBody string
+	}{
+		{"webhook refusal is a generic 403", fmt.Errorf("error generating certificate: %w", errs.ForbiddenErr(errors.New("no enrolled profile (DENIED)"), "no enrolled profile (DENIED)")), http.StatusForbidden, "certificate request denied\n"},
+		{"other errors stay 500", errors.New("kms unavailable"), http.StatusInternalServerError, "failed issuing certificate: kms unavailable\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			failSign(w, httptest.NewRequest(http.MethodPost, "/simpleenroll", http.NoBody), tt.err)
+			assert.Equal(t, tt.wantCode, w.Code)
+			assert.Equal(t, tt.wantBody, w.Body.String())
 		})
 	}
 }
