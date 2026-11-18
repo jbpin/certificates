@@ -8,6 +8,8 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"slices"
 
 	"github.com/smallstep/certificates/webhook"
@@ -166,21 +168,27 @@ func (s *EST) authorizeWithWebhook(ctx context.Context, req *ESTAuthRequest) ([]
 
 // csrMatchesCertificate reports whether the CSR asks for the same key, subject
 // and SANs as the certificate. The CSR signature is checked by the caller.
+// A CSR without SANs gets its CN as the only SAN (est/authority.go), so that
+// is what the certificate must hold.
 func csrMatchesCertificate(csr *x509.CertificateRequest, cert *x509.Certificate) bool {
 	if csr == nil || !bytes.Equal(csr.RawSubjectPublicKeyInfo, cert.RawSubjectPublicKeyInfo) ||
 		csr.Subject.String() != cert.Subject.String() {
 		return false
 	}
-	return sameStrings(csr.DNSNames, cert.DNSNames) &&
-		sameStrings(csr.EmailAddresses, cert.EmailAddresses) &&
-		sameStrings(stringsOf(csr.IPAddresses), stringsOf(cert.IPAddresses)) &&
-		sameStrings(stringsOf(csr.URIs), stringsOf(cert.URIs))
+	want := sanStrings(csr.DNSNames, csr.EmailAddresses, csr.IPAddresses, csr.URIs)
+	if len(want) == 0 {
+		want = []string{csr.Subject.CommonName}
+	}
+	return sameStrings(want, sanStrings(cert.DNSNames, cert.EmailAddresses, cert.IPAddresses, cert.URIs))
 }
 
-func stringsOf[T fmt.Stringer](in []T) []string {
-	out := make([]string, len(in))
-	for i, v := range in {
-		out[i] = v.String()
+func sanStrings(dns, emails []string, ips []net.IP, uris []*url.URL) []string {
+	out := append(append([]string{}, dns...), emails...)
+	for _, ip := range ips {
+		out = append(out, ip.String())
+	}
+	for _, u := range uris {
+		out = append(out, u.String())
 	}
 	return out
 }

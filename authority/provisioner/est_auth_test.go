@@ -22,7 +22,7 @@ import (
 	"github.com/smallstep/certificates/webhook"
 )
 
-func mustESTTestCert(t *testing.T, cn string, isCA bool, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) (*x509.Certificate, *ecdsa.PrivateKey) {
+func mustESTTestCert(t *testing.T, cn string, isCA bool, parent *x509.Certificate, parentKey *ecdsa.PrivateKey, dns ...string) (*x509.Certificate, *ecdsa.PrivateKey) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
@@ -34,6 +34,7 @@ func mustESTTestCert(t *testing.T, cn string, isCA bool, parent *x509.Certificat
 		BasicConstraintsValid: true,
 		IsCA:                  isCA,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		DNSNames:              dns,
 	}
 	signer, signerKey := tmpl, key
 	if parent != nil {
@@ -48,7 +49,8 @@ func mustESTTestCert(t *testing.T, cn string, isCA bool, parent *x509.Certificat
 
 func TestEST_authorizeWithWebhook(t *testing.T) {
 	root, rootKey := mustESTTestCert(t, "root", true, nil, nil)
-	trusted, deviceKey := mustESTTestCert(t, "device", false, root, rootKey)
+	trusted, deviceKey := mustESTTestCert(t, "device", false, root, rootKey, "device")
+	noSAN, noSANKey := mustESTTestCert(t, "device", false, root, rootKey)
 	otherRoot, otherKey := mustESTTestCert(t, "other", true, nil, nil)
 	untrusted, _ := mustESTTestCert(t, "device", false, otherRoot, otherKey)
 	rootPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.Raw})
@@ -79,8 +81,12 @@ func TestEST_authorizeWithWebhook(t *testing.T) {
 		wantLocalAllow    bool
 		wantDeniedLocally bool
 	}{
-		{name: "verified certificate renews without the webhook", enabled: &enabled,
+		{name: "verified certificate renews without the webhook (CSR without SANs gets its CN)", enabled: &enabled,
 			req: ESTAuthRequest{ClientCertificate: trusted}, wantLocalAllow: true},
+		{name: "same SANs spelled out in the CSR renew too", enabled: &enabled, csr: mkCSR(deviceKey, "device", "device"),
+			req: ESTAuthRequest{ClientCertificate: trusted}, wantLocalAllow: true},
+		{name: "a certificate without SANs does not match a SAN-less CSR (step-ca adds the CN)", enabled: &enabled, csr: mkCSR(noSANKey, "device"),
+			req: ESTAuthRequest{ClientCertificate: noSAN}, wantDeniedLocally: true},
 		{name: "verified certificate wins over a (stale) bearer token", enabled: &enabled,
 			req:            ESTAuthRequest{ClientCertificate: trusted, AuthenticationHeader: "Bearer jwt", BearerToken: "jwt"},
 			wantLocalAllow: true},
